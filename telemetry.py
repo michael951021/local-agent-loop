@@ -326,6 +326,55 @@ def commits(project, base, head):
                            f"{base}..{head}"], capture_output=True, text=True).stdout.splitlines()
 
 
+def task_state(start, end):
+    """What became of a run's task: done, split, open, interrupted, merge-fix, or running.
+    New runs record it; for older ones it is read from git (the task file at the run's last commit)."""
+    if not end:
+        return "running"
+    if end.get("task_state"):
+        return end["task_state"]
+    if start.get("merge_fix"):
+        return "merge-fix"
+    task, src, head = start.get("task"), start.get("src") or "TODO.md", end.get("head")
+    pdir = ROOT / "projects" / (start.get("project") or "")
+    lines = []
+    if task and head and (pdir / ".git").exists():
+        text = subprocess.run(["git", "-C", str(pdir), "show", f"{head}:{src}"], capture_output=True, text=True).stdout
+        lines = [l.strip().lower() for l in text.splitlines()]
+    if f"- [x] {task}".lower() in lines:
+        return "done"   # also for a run cut off after it had checked its task
+    if end.get("merged") == "paused":
+        return "interrupted"
+    if not lines:
+        return None
+    return "open" if f"- [ ] {task}".lower() in lines else "split"
+
+
+# The result of a run in plain words: (label, css class, one-line explanation).
+def result(start, end):
+    st, merged = task_state(start or {}, end), (end or {}).get("merged")
+    fix = {"yes": "merged", "conflict": "still conflicting, tried again", "parked": "gave up, work parked on a branch"}
+    if st == "running":
+        return "… running", "", "still running (or its agent was killed before it could finish)"
+    if st == "merge-fix":
+        return "↻ merge fix", "warn" if merged != "yes" else "", "resolved a merge conflict from the previous run: " + fix.get(merged, merged or "?")
+    if st == "interrupted":
+        return "⏸ interrupted", "warn", "stopped mid-task (stop --now, time limit or crash); the same agent continues it"
+    if st == "done":
+        if merged == "conflict":
+            return "✔ done", "warn", "task finished; merging hit a conflict, fixed by the next run"
+        if merged == "paused":
+            return "✔ done", "warn", "task finished before the run was cut off (stop or time limit); merged by its next run"
+        if merged == "parked":
+            return "✔ done", "bad", "task finished, but its work could not be merged (parked on a branch)"
+        return "✔ done", "good", "task finished and merged" if merged in ("yes", "n/a", None) else "task finished"
+    if st == "split":
+        return "✂ split", "", "split its task into smaller TODO lines and did the first"
+    if st == "open":
+        return "✖ not finished", "bad", "ended with its task unchecked; the task is tried again"
+    return "?", "", "unknown (no harness record)"
+
+
 def guess_task(project, t0, t1):
     """For runs without harness lines: the TODO line checked off during the run."""
     pdir = ROOT / "projects" / project

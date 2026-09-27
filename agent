@@ -254,9 +254,16 @@ will continue it: exactly 2 lines, at most 60 words in total, no preamble or for
 Line 1: what is done so far and how it works (files, approach). \
 Line 2: what is still needed to finish (next concrete steps, known problems)."
 
-handoff() {   # DIR SID → the note on stdout (empty if the session cannot be resumed)
+# A run that ends normally with its task still unchecked is asked why (shown in reports, and given to the
+# next attempt).
+DEBRIEF_PROMPT="You ended this run without finishing your task (its line is still unchecked). Answer in \
+exactly 2 short lines, at most 50 words in total, no preamble or formatting. \
+Line 1: why it was not finished (the actual blocker). \
+Line 2: what would most have helped (a tool, access, data, information, more context, or a smaller task)."
+
+handoff() {   # DIR SID [PROMPT] → the note on stdout (empty if the session cannot be resumed)
   [[ -n "$2" && "$2" != null ]] || return 0
-  sandbox "$1" -- timeout 20m claude -p "$HANDOFF_PROMPT" --resume "$2" --tools "" --max-turns 1 \
+  sandbox "$1" -- timeout 20m claude -p "${3:-$HANDOFF_PROMPT}" --resume "$2" --tools "" --max-turns 1 \
       --output-format json "${claude_args[@]}" </dev/null 2>/dev/null |
     jq -r '.result // empty' 2>/dev/null |
     python3 -c 'import sys
@@ -391,7 +398,8 @@ cmd_worker() {
     prev="$(ls -t $pat 2>/dev/null | head -1 || true)"
     if [[ -n "$prev" ]] && lr="$(python3 "$ROOT/sched.py" lastrun "$prev")"; then
       pause_task "$wt" "$st" "$wid" "$(jq -r .sid <<<"$lr")" "$lr"
-      run_end "$prev" "$(jq -r .rid <<<"$lr")" '{"merged": "paused"}'
+      run_end "$prev" "$(jq -r .rid <<<"$lr")" "$(jq -n --arg n "$(jq -r '.handoff // ""' "$st/workers/$wid.resume")" \
+        '{merged: "paused", task_state: "interrupted", session: "cut off", note: $n}')"
     fi
   fi
   trap 'echo; echo "stopped."; exit 130' INT TERM
@@ -440,19 +448,35 @@ cmd_worker() {
       --arg br "$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null)" --argjson c "$conflict" \
       --argjson n "$(live_workers "$name" | wc -l)" --argjson np "$NUM_PARALLEL" --argjson ctx "$NUM_CTX" \
       '{project: $p, worker: $w, workdir: $d, base: $b, branch: $br, agents: $n, num_parallel: $np, num_ctx: $ctx,
-        task: .task, src: .src, parent: .parent, attempts: .attempts, merge_fix: ($c > 0)}' <<<"$j")"
+        task: .task, src: .src, parent: .parent, attempts: .attempts, merge_fix: ($c > 0), resumed: (.resumed // false)}' <<<"$j")"
     # hooks/task_done.py tells the agent to stop once this line is checked (merge-fix runs have no task).
     local src; src="$(jq -r '.src // "TODO.md"' <<<"$j")"
     SB_ENV=(); ((conflict)) || SB_ENV=(--setenv AGENT_TASK "$task" --setenv AGENT_TASK_SRC "$src")
     headless "$wt" "$prompt" "$log" "$rid" || echo "(run exited non-zero)"
     SB_ENV=()
-    local head merged="n/a" checked=0
+    local head merged="n/a" checked=0 was_fix=$conflict sid session state=open note=""
+    sid="$(tail -n "+$((n0 + 1))" "$log" | grep -m1 '"subtype":"init"' | jq -r .session_id || true)"
+    session="$(tail -n "+$((n0 + 1))" "$log" | grep '"type":"result"' | tail -1 |   # key order varies
+      jq -r 'if .is_error then (if .subtype == "success" then "error" else .subtype end) else .subtype end' 2>/dev/null || true)"
     grep -qiF -- "- [x] $task" "$wt/$src" 2>/dev/null && checked=1
-    # Cut off after its task was checked (it ran on past it): that is a finished run, merge it.
-    if ((conflict == 0 && checked == 0)) && ! tail -n "+$((n0 + 1))" "$log" | grep -q '"type":"result"'; then   # key order varies
-      pause_task "$wt" "$st" "$wid" "$(tail -n "+$((n0 + 1))" "$log" | grep -m1 '"subtype":"init"' | jq -r .session_id)" \
-        "$(cat "$st/workers/$wid.json" 2>/dev/null || echo '{}')"
-      merged="paused"
+    # What became of the task: done, split (its line replaced by smaller ones), or still open.
+    if ((was_fix)); then state="merge-fix"
+    elif ((checked)); then state="done"
+    elif ! grep -qF -- "- [ ] $task" "$wt/$src" 2>/dev/null; then state="split"
+    fi
+    # Cut off before its task was checked: pause it (handoff, same agent continues). Cut off after (it ran
+    # on past its task) counts as finished.
+    if [[ "$state" == open && -z "$session" ]]; then
+      pause_task "$wt" "$st" "$wid" "$sid" "$(cat "$st/workers/$wid.json" 2>/dev/null || echo '{}')"
+      merged="paused"; state="interrupted"; note="$(jq -r '.handoff // ""' "$st/workers/$wid.resume" 2>/dev/null)"
+    elif [[ "$state" == open ]]; then
+      echo -e "\033[33m✖ task not finished — asking the agent why\033[0m"
+      note="$(handoff "$wt" "$sid" "$DEBRIEF_PROMPT")"
+      # A session that died on an error (e.g. a failed compaction) often cannot be resumed: keep the error.
+      [[ -n "$note" ]] || note="$(tail -n "+$((n0 + 1))" "$log" | grep '"type":"result"' | tail -1 |
+        jq -r 'select(.is_error) | "Session error: " + (.result // "unknown")' 2>/dev/null | cut -c1-300 || true)"
+      [[ -n "$note" ]] && echo -e "\033[2m$note\033[0m"
+      python3 "$ROOT/sched.py" note "$st" "$(jq -r '.akey // ""' <<<"$j")" "$note"
     fi
     autocommit "$wt" "$wid: ${task:0:70}" || true
     head="$(git -C "$wt" rev-parse HEAD)"
@@ -475,7 +499,8 @@ cmd_worker() {
       fi
     fi
     ((conflict)) || python3 "$ROOT/sched.py" release "$st" "$wid"
-    run_end "$log" "$rid" "$(jq -n --arg h "$head" --arg m "$merged" '{head: $h, merged: $m}')"
+    run_end "$log" "$rid" "$(jq -n --arg h "$head" --arg m "$merged" --arg ts "$state" --arg s "${session:-cut off}" \
+      --arg n "$note" '{head: $h, merged: $m, task_state: $ts, session: $s, note: $n}')"
     if [[ "$head" == "$base" ]]; then
       stuck=$((stuck + 1))
       echo "no changes this iteration ($stuck/${STUCK_LIMIT/#0/∞})"

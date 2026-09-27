@@ -35,6 +35,10 @@ def msg(n, text, tokens):
                                     "content": [{"type": "thinking", "thinking": "x" * 400}, {"type": "text", "text": text}]})
 
 
+if "--resume" in sys.argv and "without finishing your task" in prompt:
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result":
+                      "Blocked: the fake task is marked [fail].\nWould have helped: a task without [fail]."}))
+    sys.exit(0)
 if "--resume" in sys.argv and "Write a handoff" in prompt:
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result":
                       "Done: partial file written, approach fake.\nNext: finish the task and check its box."}))
@@ -65,7 +69,7 @@ else:
             s.write(f"{os.environ.get('AGENT_WORKER')} resumed {task.split(':')[0]}\n")
     time.sleep(0 if resumed else float((re.search(r"\[sleep ([\d.]+)\]", task) or [0, 3])[1]))
     if "[fail]" in task:
-        note = "failed on purpose"
+        note = "failed on purpose" + (" (saw the earlier debrief)" if "Would have helped: a task without" in prompt else "")
     else:
         f = re.search(r"\[file (\S+)\]", task)
         if f:

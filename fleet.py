@@ -15,7 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import reportui
-from telemetry import (ROOT, agent_tag, attribute, clean_task, fair_share, gpu_samples, harness_runs, ledger,
+from telemetry import (ROOT, result, task_state, agent_tag, attribute, clean_task, fair_share, gpu_samples, harness_runs, ledger,
                        ollama_requests, vram_budget)
 
 REPORTS = ROOT / "reports"
@@ -73,17 +73,20 @@ def build(hours=24):
             "t": f"<b>{html.escape(r['tag'])}</b> · slot {r['slot']} · {time.strftime('%H:%M', time.localtime(r['t']))}"
                  f"<div class='note'>{r['prompt'] / 1000:.1f}k prompt · {r['prefill_s']:.0f}s reading · "
                  f"{r['gen']} tokens in {r['gen_s']:.0f}s{' · cancelled' if r['cancelled'] else ''}</div>"})
-    per = {t: {"runs": 0, "done": 0, "merged": 0, "conflicts": 0, "parked": 0, "run_s": 0.0} for t in tags}
+    per = {t: {"runs": 0, "done": 0, "open": 0, "interrupted": 0, "fixes": 0, "merged": 0, "conflicts": 0, "parked": 0, "run_s": 0.0} for t in tags}
     for run in runs:
         st, en = run["start"], run["end"]
         tag = agent_tag(st)
         b = en["t"] if en else now
-        p = per.setdefault(tag, {"runs": 0, "done": 0, "merged": 0, "conflicts": 0, "parked": 0, "run_s": 0.0})
+        p = per.setdefault(tag, {"runs": 0, "done": 0, "open": 0, "interrupted": 0, "fixes": 0, "merged": 0, "conflicts": 0, "parked": 0, "run_s": 0.0})
         p["runs"] += 1
         p["run_s"] += b - st["t"]
         if en:
-            m = en.get("merged")
-            p["done"] += 1
+            m, ts = en.get("merged"), task_state(st, en)
+            p["done"] += ts == "done"
+            p["open"] += ts == "open"
+            p["interrupted"] += ts == "interrupted"
+            p["fixes"] += ts == "merge-fix"
             p["merged"] += m == "yes" or (m == "n/a" and en.get("head") != st.get("base"))
             p["conflicts"] += m == "conflict"
             p["parked"] += m == "parked"
@@ -92,7 +95,8 @@ def build(hours=24):
             "a": round((st["t"] - t0) / 60, 3), "b": round((b - t0) / 60, 3), "href": href,
             "t": f"<b>{html.escape(tag)}</b> · {html.escape(clean_task(st.get('task'))[:140] or 'run')}"
                  f"<div class='note'>{time.strftime('%H:%M', time.localtime(st['t']))} · {(b - st['t']) / 60:.0f} min"
-                 f"{' · running' if not en else ' · ' + str(en.get('merged'))}{' · click for its report' if href else ''}</div>"})
+                 f" · {result(st, en)[0]}{' · click for its report' if href else ''}</div>"
+                 + (f"<div class='note'>{html.escape(en['note'])}</div>" if en and en.get("note") else "")})
 
     table = []
     for t in tags:
@@ -100,7 +104,8 @@ def build(hours=24):
         tps = sorted(r["tps"] for r in mine if r["tps"])
         prompts = sorted(r["prompt"] for r in mine)
         p = per.get(t, {})
-        table.append({"tag": t, "runs": p.get("runs", 0), "merged": p.get("merged", 0), "conflicts": p.get("conflicts", 0),
+        table.append({"tag": t, "runs": p.get("runs", 0), "done": p.get("done", 0), "open": p.get("open", 0),
+                      "interrupted": p.get("interrupted", 0), "fixes": p.get("fixes", 0), "merged": p.get("merged", 0), "conflicts": p.get("conflicts", 0),
                       "parked": p.get("parked", 0), "run_s": round(p.get("run_s", 0)), "requests": len(mine),
                       "prefill_s": round(sum(r["prefill_s"] for r in mine)), "gen_s": round(sum(r["gen_s"] for r in mine)),
                       "gen_tok": sum(r["gen"] for r in mine), "tps": tps[len(tps) // 2] if tps else None,
@@ -123,6 +128,8 @@ def build(hours=24):
                 "power": [[round(s["g"][i][3]) if i in s["g"] else None for s in gpu] for i in gids], "cap_gb": round(cap, 1)},
         "vram": vram_budget(), "slots": max((r["slot"] for r in reqs), default=0) + 1,
         "stats": {"agents": len(agents), "runs": len(runs), "finished": sum(1 for r in runs if r["end"]),
+                  "tasks_done": sum(p["done"] for p in per.values()), "not_done": sum(p["open"] for p in per.values()),
+                  "fixes": sum(p["fixes"] for p in per.values()),
                   "merged": sum(p["merged"] for p in per.values()), "conflicts": sum(p["conflicts"] for p in per.values()),
                   "requests": len(reqs), "gen_tok": gen_tok, "agg_tps": round(gen_tok / busy, 1) if busy else None,
                   "busy_pct": round(100 * busy / (now - t0), 1),
@@ -141,7 +148,7 @@ const hrs=s=>s>=3600?(s/3600).toFixed(1)+' h':Math.round(s/60)+' min';
 let h=`<h1>Agent fleet</h1><div class="sub">Last ${mins(D.span_min)} · built ${D.built} · ${D.live.length?'running now: <b>'+D.live.map(esc).join(', ')+'</b>':'no agents running'} · <a href="index.html">all reports</a></div>`;
 h+='<div class="tiles">'+[
  tile('Agents',S.agents,`${D.slots} model slot${D.slots>1?'s':''} in use · ${S.servers.map(esc).join(' + ')||'–'}`),
- tile('Runs',S.runs,`${S.finished} finished · ${S.merged} with changes merged`),
+ tile('Tasks done',S.tasks_done,`in ${S.runs} runs · ${S.not_done} not finished · ${S.fixes} merge-fix runs`,S.not_done?'warn':''),
  tile('Merge conflicts',S.conflicts,S.conflicts?'resolved by the agent on its next run':'none',S.conflicts?'warn':''),
  tile('GPU busy',S.busy_pct+'%',`of the time · 2+ requests at once ${S.overlap_pct}% of busy time`),
  tile('Throughput',S.agg_tps!=null?f1(S.agg_tps)+' t/s':'–',`${k(S.gen_tok)} tokens generated, all agents`),
@@ -160,9 +167,9 @@ if(V){const gib=m=>m/1024,cap=D.gpu.cap_gb||gib(V.weights+V.kv+V.recurrent+V.com
 const gid=D.gpu.ids.map((g,i)=>({n:'GPU '+g,c:col(i)}));
 h+='<div class="grid3">'+card('GPU utilization','% per GPU, 1-minute average','<div id="gu"></div>'+legend(gid))
  +card('VRAM','GB per GPU','<div id="gv"></div>'+legend(gid))+card('Power','W per GPU','<div id="gp"></div>'+legend(gid))+'</div>';
-h+=card('Per agent','GPU share charges overlapping requests equally. Runs merged = runs whose commits reached the project branch.',
- '<div style="overflow-x:auto"><table><tr><th>Agent</th><th class="num">Runs</th><th class="num">Merged</th><th class="num">Conflicts</th><th class="num">Run time</th><th class="num">Requests</th><th class="num">Median prompt</th><th class="num">Reading</th><th class="num">Generating</th><th class="num">Tokens out</th><th class="num">Median t/s</th><th class="num">GPU share</th></tr>'+
- D.table.map(r=>`<tr><td><span class="sw" style="background:${agentCol(r.tag)}"></span>${esc(r.tag)}</td><td class="num">${r.runs}</td><td class="num">${r.merged}</td><td class="num">${r.conflicts}${r.parked?' · '+r.parked+' parked':''}</td><td class="num">${hrs(r.run_s)}</td><td class="num">${r.requests}</td><td class="num">${k(r.prompt)}</td><td class="num">${hrs(r.prefill_s)}</td><td class="num">${hrs(r.gen_s)}</td><td class="num">${k(r.gen_tok)}</td><td class="num">${f1(r.tps)}</td><td class="num">${r.share_pct}%</td></tr>`).join('')+'</table></div>');
+h+=card('Per agent','GPU share charges overlapping requests equally. Done = runs that finished their task; not finished = ended with the task unchecked (see the note on its lane).',
+ '<div style="overflow-x:auto"><table><tr><th>Agent</th><th class="num">Runs</th><th class="num">Tasks done</th><th class="num">Not finished</th><th class="num">Interrupted</th><th class="num">Merge conflicts</th><th class="num">Run time</th><th class="num">Requests</th><th class="num">Median prompt</th><th class="num">Reading</th><th class="num">Generating</th><th class="num">Tokens out</th><th class="num">Median t/s</th><th class="num">GPU share</th></tr>'+
+ D.table.map(r=>`<tr><td><span class="sw" style="background:${agentCol(r.tag)}"></span>${esc(r.tag)}</td><td class="num">${r.runs}</td><td class="num">${r.done}</td><td class="num">${r.open}</td><td class="num">${r.interrupted}</td><td class="num">${r.conflicts}${r.parked?' · '+r.parked+' parked':''}</td><td class="num">${hrs(r.run_s)}</td><td class="num">${r.requests}</td><td class="num">${k(r.prompt)}</td><td class="num">${hrs(r.prefill_s)}</td><td class="num">${hrs(r.gen_s)}</td><td class="num">${k(r.gen_tok)}</td><td class="num">${f1(r.tps)}</td><td class="num">${r.share_pct}%</td></tr>`).join('')+'</table></div>');
 app.innerHTML=h;
 document.querySelectorAll('[data-t]').forEach(n=>hover(n,esc(n.dataset.t)));
 lanes(document.getElementById('lanes'),{x1:D.span_min,xfmt:clock,lanes:D.lanes.map(l=>({name:l.tag,c:agentCol(l.tag),runs:l.runs,reqs:l.reqs}))});

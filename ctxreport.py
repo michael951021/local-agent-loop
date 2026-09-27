@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 import reportui
-from telemetry import (prompt_tokens, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
+from telemetry import (prompt_tokens, result, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
                        guess_task, harness_runs, ledger, log_runs, ollama_requests, read_session)
 
 REPORTS = ROOT / "reports"
@@ -290,6 +290,11 @@ def build(log, sid, trigger, run=None):
         "title": task or f"session {sid[:8]}",
         "project": project, "worker": worker, "tag": tag, "sid": sid, "trigger": trigger, "log": log.name,
         "branch": (start or {}).get("branch"), "merged": (end or {}).get("merged"),
+        # What became of the task, in plain words; the agent's own note when it did not finish.
+        "result": dict(zip(("label", "cls", "why"), result(start, end))) if start else None,
+        "note": (end or {}).get("note") or (f"Session error: {res.get('result')}" if res and res.get("is_error") and res.get("result") else None),
+        "attempt": {"n": (start or {}).get("attempts"), "resumed": bool((start or {}).get("resumed")),
+                    "merge_fix": bool((start or {}).get("merge_fix"))},
         "start": begun.strftime("%Y-%m-%d %H:%M"), "window": window,
         "cats": [{"key": k, "name": n} for k, n in CATS],
         "calls": [{"turn": c["turn"], "min": round((c["t"] - t0) / 60, 2) if c["t"] else None, "total": c["total"],
@@ -307,6 +312,7 @@ def build(log, sid, trigger, run=None):
                 "cap_gb": round(vram_cap, 1)},
         "stats": {
             "wall_min": round(wall / 60, 1), "turns": len(a["calls"]),
+            # Claude Code's session status (success = the session ended normally, not that the task got done).
             "outcome": ("error" if res.get("is_error") else res.get("subtype")) if res else "running / killed",
             "peak": peak, "peak_pct": round(100 * peak / window, 1), "end_ctx": a["calls"][-1]["total"],
             "real_peak": max((r["prompt"] for r in reqs), default=None),
@@ -326,7 +332,8 @@ def build(log, sid, trigger, run=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     name = f"{begun.strftime('%Y%m%d-%H%M')}-{'' if worker == 'main' else worker + '-'}{sid[:8]}-{trigger}"
     (out_dir / f"{name}.html").write_text(reportui.page(data["title"][:80], data, TEMPLATE_JS))
-    summary = {k: data[k] for k in ("title", "project", "worker", "tag", "start", "trigger", "merged")} | {
+    summary = {k: data[k] for k in ("title", "project", "worker", "tag", "start", "trigger", "merged", "result",
+                                    "note", "attempt")} | {
         "run": (start or {}).get("run"), "share_pct": share and share["mine_pct"]} | {
         k: data["stats"][k] for k in ("wall_min", "turns", "peak_pct", "think_pct", "gen_tps", "util_avg", "outcome",
                                       "compactions", "retries")}
@@ -336,20 +343,35 @@ def build(log, sid, trigger, run=None):
 
 
 def build_index():
-    rows = []
-    for f in sorted(REPORTS.glob("*/*.json"), key=lambda p: p.name[:13], reverse=True):
+    # One row per run: its end report, else its newest compaction snapshot (still running or killed).
+    runs, snaps = {}, defaultdict(int)
+    for f in sorted(REPORTS.glob("*/*.json"), key=lambda p: p.name):
         s = json.loads(f.read_text())
+        k = s.get("run") or f.stem.rsplit("-", 1)[0]
+        snaps[k] += s["trigger"] == "compact"
+        if k not in runs or s["trigger"] == "end" or runs[k][1]["trigger"] != "end":
+            runs[k] = (f, s)
+    rows = []
+    for k, (f, s) in sorted(runs.items(), key=lambda kv: (kv[1][1]["start"], kv[1][0].name), reverse=True):
         who = s.get("tag") or s["project"]
-        merged = {"conflict": " · merge conflict", "parked": " · parked"}.get(s.get("merged"), "")
+        r = s.get("result") or {"label": s["outcome"], "cls": "", "why": ""}
+        at = s.get("attempt") or {}
+        tries = ("merge fix" if at.get("merge_fix") else "continued" if at.get("resumed")
+                 else f"#{at['n']}" if (at.get("n") or 1) > 1 else "")
+        note = f'<div class="note">{html.escape(s["note"])}</div>' if s.get("note") else ""
+        side = [x for x in (f'session: {s["outcome"]}' if s["outcome"] not in ("success", "running / killed") else "",
+                            f'{s["compactions"]} compaction{"s" if s["compactions"] != 1 else ""}' if s["compactions"] else "",
+                            f'{s["retries"]} retries' if s["retries"] else "") if x]
         rows.append(
             f'<tr><td class="num">{s["start"]}</td><td>{html.escape(who)}</td>'
-            f'<td><a href="{f.parent.name}/{f.stem}.html">{html.escape(short(s["title"], 90))}</a></td>'
-            f'<td>{s["trigger"]}</td><td class="num">{s["wall_min"]}</td><td class="num">{s["turns"]}</td>'
+            f'<td><a href="{f.parent.name}/{f.stem}.html">{html.escape(short(s["title"], 90))}</a>{note}</td>'
+            f'<td>{tries}</td>'
+            f'<td><span class="{r["cls"]}" title="{html.escape(r["why"])}"><b>{html.escape(r["label"])}</b></span>'
+            f'<div class="note">{html.escape(r["why"])}{" · " + " · ".join(side) if side else ""}</div></td>'
+            f'<td class="num">{s["wall_min"]}</td><td class="num">{s["turns"]}</td>'
             f'<td class="num">{s["peak_pct"]}%</td><td class="num">{s["think_pct"]}%</td>'
             f'<td class="num">{s["gen_tps"] and round(s["gen_tps"], 1)}</td>'
-            f'<td class="num">{s["share_pct"] if s.get("share_pct") is not None else "–"}</td>'
-            f'<td>{html.escape(str(s["outcome"]))}{merged}{" · " + str(s["compactions"]) + " compact" if s["compactions"] else ""}'
-            f'{" · " + str(s["retries"]) + " retries" if s["retries"] else ""}</td></tr>')
+            f'<td class="num">{s["share_pct"] if s.get("share_pct") is not None else "–"}</td></tr>')
     REPORTS.mkdir(exist_ok=True)
     (REPORTS / "index.html").write_text(INDEX.replace("__ROWS__", "\n".join(rows)))
     try:
@@ -396,11 +418,13 @@ def main():
 INDEX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent run reports</title>
 <style>""" + reportui.CSS + """</style></head><body><main><h1>Agent run reports</h1>
-<div class="sub">One row per report — written at the end of each run and at every compaction. Newest first.
+<div class="sub">One row per run, newest first. <b>Result</b> is what became of the task (done / not finished /
+ interrupted / split / merge fix), not whether the Claude session ended cleanly; when a task was not finished the
+ agent's own note says why and what would have helped.
  · <a href="fleet.html"><b>Fleet view</b></a>: every agent on one timeline, and how they share the GPUs</div>
-<section class="card" style="overflow-x:auto"><table><tr><th>Start</th><th>Agent</th><th>Task</th><th>Trigger</th>
+<section class="card" style="overflow-x:auto"><table><tr><th>Start</th><th>Agent</th><th>Task</th><th>Attempt</th><th>Result</th>
 <th class="num">Min</th><th class="num">Turns</th><th class="num">Peak ctx</th><th class="num">Thinking</th>
-<th class="num">Gen t/s</th><th class="num">GPU share %</th><th>Outcome</th></tr>
+<th class="num">Gen t/s</th><th class="num">GPU share %</th></tr>
 __ROWS__</table></section></main></body></html>"""
 
 
@@ -411,16 +435,19 @@ const who=D.worker&&D.worker!=='main'?`${esc(D.project)} / <b>${esc(D.worker)}</
 const merge={yes:'merged',conflict:'<span class="warn">merge conflict</span>',parked:'<span class="bad">parked</span>',nothing:'no changes'}[D.merged]||'';
 let h=`<h1>${esc(D.title)}</h1><div class="sub">${who} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
 h+='<div class="tiles">'+[
- tile('Peak context',k(S.peak),`${pk}% of ${k(D.window)} window${S.real_peak?` · Ollama saw ${k(S.real_peak)}`:''}`,pkc),
+ tile('Peak context',k(S.peak),`${pk}% of ${k(D.window)} window${S.real_peak?` · the server saw ${k(S.real_peak)}`:''}`,pkc),
  tile('Thinking share',S.think_pct+'%','of all context growth'),
  tile('Turns',S.turns,`${S.compactions} compaction${S.compactions==1?'':'s'} · ${S.retries} retr${S.retries==1?'y':'ies'}`,S.retries?'warn':''),
- tile('Outcome',esc(S.outcome),S.cancelled?`${S.cancelled} request${S.cancelled>1?'s':''} cancelled`:'',S.outcome==='success'?'':'bad'),
+ D.result?tile('Result',esc(D.result.label),esc(D.result.why)+(D.attempt&&D.attempt.n>1?` · attempt ${D.attempt.n}`:'')+` · session: ${esc(S.outcome)}`,D.result.cls):
+  tile('Session',esc(S.outcome),'Claude Code session status',S.outcome==='success'?'':'bad'),
  tile('Generation',S.gen_tps?f1(S.gen_tps)+' t/s':'–',`${k(S.gen_tok)} tokens out · median`),
  tile('Prefill',S.pp_tps?k(S.pp_tps)+' t/s':'–',`cache reuse ${S.reuse_pct??'–'}% · ${S.full_reprocess} full reprocess`,S.full_reprocess>S.requests/3?'warn':''),
  D.share?tile('GPU share',D.share.mine_pct+'%',`of busy GPU time · ${D.share.agents} agent${D.share.agents>1?'s':''} · overlap ${D.share.overlap_pct}%`):'',
  tile('GPU util',S.util_avg!=null?S.util_avg+'%':'–','average, all GPUs'),
  tile('VRAM peak',S.vram_peak!=null?f1(S.vram_peak)+' GB':'–',`of ${S.vram_cap||'–'} GB · ${S.power_avg??'–'} W avg · ${S.energy_wh} Wh`),
 ].join('')+'</div>';
+if(D.note)h+=card(D.result&&D.result.label.includes('interrupted')?'Handoff from the agent':'Why it did not finish, in the agent\'s words',
+ 'Written by the agent itself right after the run (at most 2 lines).',`<div class="mono" style="white-space:pre-wrap">${esc(D.note)}</div>`);
 
 // time split
 const tw=[['Prefill (reading prompt)',S.prefill_s,col(0)],['Generation',S.gen_s,col(1)],['Tools + idle',S.other_s,col(2)]],tws=tw.reduce((a,b)=>a+b[1],0)||1;

@@ -4,6 +4,7 @@
   sched.py next    STATE WORKER DIR [--ref REF]   claim the next task; prints JSON (exit codes below)
   sched.py release STATE WORKER                   drop WORKER's claim
   sched.py status  STATE DIR [--ref REF]          workers, claims and what each open task waits on
+  sched.py note    STATE AKEY TEXT                 remember why an attempt at a task failed (next prompt)
   sched.py lastrun LOG                            the log's last run if it never ended (killed, crashed):
                                                   JSON {task, src, parent, key, sid}; exit 1 if it ended
 
@@ -192,6 +193,10 @@ def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
         p += (f"\n\nThis is attempt {attempts} at this task; earlier attempts did not finish it. Read NOTES.md "
               "for what was tried and why it failed, and try a different approach. Record this attempt's "
               "outcome in NOTES.md.")
+
+    if job.get("debrief") and not resume:
+        p += ("\n\nAn earlier attempt at this task ended without finishing it. Its own account (why, and what "
+              "would have helped):\n" + "\n".join(f"> {l}" for l in job["debrief"].splitlines()))
     if step_abandon:
         p += (f"\n\nThis step has now failed {attempts - 1} times. Do not attempt it again: follow the On "
               f"failure section of {job['src']} (use reason STEP_FAILED if no other reason fits), then stop.")
@@ -230,6 +235,7 @@ def cmd_next(st, worker, d, ref):
                 continue
             attempts[akey] = n
             st.save("attempts.json", attempts)
+            job["debrief"] = st.load("debriefs.json", {}).get(akey)
             if job["next"] is None:
                 i = todo_open.index(entry["text"])
                 job["todo_next"] = todo_open[i + 1:i + 3]
@@ -304,6 +310,13 @@ def main():
         code, out = cmd_next(st, a[2], a[3], ref)
         print(json.dumps(out))
         sys.exit(code)
+    if cmd == "note":
+        with st.lock():
+            notes = st.load("debriefs.json", {})
+            if a[3].strip():
+                notes[a[2]] = a[3].strip()
+                st.save("debriefs.json", notes)
+        return
     if cmd == "release":
         with st.lock():
             (st.d / "workers" / f"{a[2]}.json").unlink(missing_ok=True)

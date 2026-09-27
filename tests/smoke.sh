@@ -77,6 +77,9 @@ new "$P-one" '- [ ] P: works [file p.txt] [sleep 1]
 out="$("$A" loop "$P-one" -j 1 </dev/null 2>&1)"
 check "P done in place (no worktree)" bash -c "grep -q '^- \[x\] P' '$ROOT/projects/$P-one/TODO.md' && [[ ! -d '$ROOT/work/$P-one' ]]"
 check "Q retried with an attempt-2 prompt, then given up" grep -q "gave up after 2 attempts" <<<"$out"
+check "the failed run recorded 'not finished' and the agent's reason" bash -c "grep -h '\"event\":\"end\"' '$ROOT'/logs/$P-one-*.jsonl | jq -e 'select(.task_state==\"open\") | .note | test(\"^Blocked\")' >/dev/null"
+check "the next attempt's prompt carried that reason" bash -c "grep -q 'saw the earlier debrief' '$ROOT'/logs/$P-one-*.jsonl"
+check "the report says not finished, with the reason" bash -c "grep -l 'not finished' '$ROOT'/reports/$P-one/*-end.json | xargs grep -q 'Would have helped'"
 check "R not started: it depends on Q" bash -c "grep -q '^- \[ \] R' '$ROOT/projects/$P-one/TODO.md'"
 check "loop ended on the blocked dependency" grep -q "depend on tasks that were given up" <<<"$out"
 
