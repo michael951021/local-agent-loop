@@ -314,8 +314,8 @@ cmd_worker() {
     main="$(git -C "$dir" symbolic-ref --short HEAD)"
     wt="$ROOT/work/$name/$wid" tag="$name/$wid" ref=(--ref "$main")
     log="$LOGS/$name-$wid-$(date +%Y%m%d-%H%M%S).jsonl"
-    setup_parallel_repo "$dir"
-    ensure_worktree "$dir" "$wt" "agent/$wid" "$main"
+    # Agents start together; git config and worktree creation take a lock, so do them one at a time.
+    ( flock 9; setup_parallel_repo "$dir"; ensure_worktree "$dir" "$wt" "agent/$wid" "$main" ) 9>"$st/merge.lock"
     # git inside the sandbox needs the shared .git and the merge driver at their host paths.
     SB_BINDS+=(--bind "$dir/.git" "$dir/.git" --ro-bind "$ROOT/mergelines.py" "$ROOT/mergelines.py")
     # Gitignored runtime data every agent shares with the main checkout (venvs, clones, databases).
