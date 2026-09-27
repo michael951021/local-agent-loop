@@ -20,6 +20,16 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/agent/hooks/task_done.py"
+          }
+        ]
+      }
     ]
   },
   "includeCoAuthoredBy": false,
