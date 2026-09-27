@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """HTTP proxy to Ollama that keeps slow SSE streams alive.
 
-  keepalive.py PORT HOST:PORT [--tag TAG]   listen on 127.0.0.1:PORT (0 = pick one; printed first)
+  keepalive.py PORT HOST:PORT [--tag TAG] [--ollama-shim MODEL]
+                                           listen on 127.0.0.1:PORT (0 = pick one; printed first)
 
 Ollama sends a tool_use block only once the whole call is generated, so a long Write can leave the
 stream silent for minutes and trip Claude Code's 300 s idle watchdog. While the upstream request is
@@ -12,6 +13,10 @@ so a request that is truly stuck still times out.
 Every /v1/messages request is also appended to logs/requests/YYYYMMDD.jsonl with TAG (the agent it
 belongs to), its timing and token usage, so reports can attribute Ollama's GPU time per agent. The bodies of requests the server rejects
 (status >= 400) are kept in logs/requests/failed/ (the last 20).
+
+With --ollama-shim (the upstream is llama-server), Ollama's metadata endpoints /api/tags, /api/ps and
+/api/version are answered here with MODEL, so project scripts that check the model the Ollama way
+keep working; everything else (/v1/...) goes to llama-server.
 """
 import asyncio
 import json
@@ -114,11 +119,26 @@ async def relay_sse(up_r, headers, client_w, start, usage):
     return pings
 
 
-async def handle(client_r, client_w, upstream, tag):
+def shim(path, model):
+    """Ollama-style answers for llama-server (see --ollama-shim)."""
+    m = {"name": f"{model}:latest", "model": f"{model}:latest", "size": 0, "size_vram": 0,
+         "details": {"family": "qwen35", "format": "gguf"}, "capabilities": ["completion", "tools", "thinking"]}
+    return {"/api/tags": {"models": [m]}, "/api/ps": {"models": [m]},
+            "/api/version": {"version": "llama-server"}}.get(path)
+
+
+async def handle(client_r, client_w, upstream, tag, model=None):
     up_w, entry = None, None
     try:
         first, lines, headers = await read_head(client_r)
         body = await client_r.readexactly(int(headers.get("content-length", 0)))
+        answer = model and shim(first.split(" ")[1].split("?")[0], model)
+        if answer:
+            data = json.dumps(answer).encode()
+            client_w.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                           b"Connection: close\r\n\r\n" % len(data) + data)
+            await client_w.drain()
+            return
         start = time.monotonic()
         if "/v1/messages" in first and "count_tokens" not in first:
             entry = {"tag": tag, "t0": round(time.time(), 3), "path": first.split(" ")[1].split("?")[0]}
@@ -162,9 +182,10 @@ async def handle(client_r, client_w, upstream, tag):
 async def main():
     port, target = int(sys.argv[1]), sys.argv[2]
     tag = sys.argv[sys.argv.index("--tag") + 1] if "--tag" in sys.argv else "untagged"
+    model = sys.argv[sys.argv.index("--ollama-shim") + 1] if "--ollama-shim" in sys.argv else None
     host, tport = target.rsplit(":", 1)
     server = await asyncio.start_server(
-        lambda r, w: handle(r, w, (host, int(tport)), tag), "127.0.0.1", port, limit=1 << 20)
+        lambda r, w: handle(r, w, (host, int(tport)), tag, model), "127.0.0.1", port, limit=1 << 20)
     print(server.sockets[0].getsockname()[1], flush=True)
     parent = os.getppid()
     async with server:

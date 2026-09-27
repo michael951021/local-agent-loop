@@ -164,7 +164,7 @@ def resolve(files, entry):
     return {"task": text, "src": src, "line": entry["line"], "parent": parent, "cl": cl, "next": None}
 
 
-def prompt(files, job, attempts, step_abandon, others, resume=None):
+def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
     p = (ROOT / "prompts" / "loop.md").read_text().rstrip()
     p += f"\n\n## Your task ({job['src']} line {job['line']})\n{job['task']}"
     if job["cl"] and not job["parent"]:
@@ -183,8 +183,9 @@ def prompt(files, job, attempts, step_abandon, others, resume=None):
               "avoid editing the files they will need)\n" + "\n".join(f"- {w}: {t}" for w, t in others))
     if resume:
         p += ("\n\n## Continue an interrupted run\nA previous run on this task was stopped before it finished. "
-              "Its work is already committed on your branch (`git log`/`git diff` against the main branch show "
-              "it); it may be incomplete or untested. Its handoff note:\n"
+              + (f"Its work is already committed on your branch (`git log {ref}..HEAD` and `git diff {ref}...HEAD` "
+                 "show it)" if ref else "Its work is already committed (see `git log -3` and `git show`)")
+              + "; it may be incomplete or untested. Its handoff note:\n"
               + "\n".join(f"> {l}" for l in (resume.get("handoff") or "(none: the run could not write one)").splitlines())
               + "\nCheck what is there, then finish the task.")
     elif attempts > 1:
@@ -237,7 +238,7 @@ def cmd_next(st, worker, d, ref):
                        step_abandon=bool(job["parent"] and max_step and n > max_step),
                        resumed=bool(resume and entry["key"] == resume["key"]),
                        prompt=prompt(files, job, n, bool(job["parent"] and max_step and n > max_step), others,
-                                     resume if resume and entry["key"] == resume["key"] else None))
+                                     resume if resume and entry["key"] == resume["key"] else None, ref))
             st.save(f"workers/{worker}.json", {"worker": worker, "pid": int(os.environ.get("AGENT_PID") or os.getppid()), "key": entry["key"],
                                                "task": job["task"], "since": time.time()})
             return 0, job

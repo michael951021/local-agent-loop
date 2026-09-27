@@ -79,10 +79,10 @@ CODE = ["Write a complete Python module that parses GitHub issue timeline events
         "with upserts, a --dry-run flag, logging, and tests."]
 
 
-def code(q):
+def code(q, think=False):
     t = time.time()
     r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": q}], "max_tokens": 600,
-                                      "chat_template_kwargs": {"enable_thinking": False}})
+                                      "chat_template_kwargs": {"enable_thinking": think}})
     tm = r["timings"]
     return {"wall": time.time() - t, "tps": tm["predicted_n"] / tm["predicted_ms"] * 1000, "n": tm["predicted_n"],
             "draft": (tm.get("draft_n_accepted"), tm.get("draft_n"))}
@@ -93,6 +93,13 @@ cw1 = sum(r["wall"] for r in c1)
 cw2, c2 = together([lambda q=q: code(q) for q in CODE])
 print(f"   one at a time: {cw1:6.1f} s ({c1[0]['tps']:.1f} tok/s, draft accepted/drafted {c1[0]['draft']})"
       f"   two at once: {cw2:6.1f} s -> {cw1 / cw2:.2f}x, {sum(r['n'] for r in c2) / cw2:.1f} tok/s total")
+
+print("2c. thinking on (most of what agents generate): 600 tokens out")
+k1 = [code(q, True) for q in CODE]
+kw1 = sum(r["wall"] for r in k1)
+kw2, k2 = together([lambda q=q: code(q, True) for q in CODE])
+print(f"   one at a time: {kw1:6.1f} s ({k1[0]['tps']:.1f} tok/s, draft accepted/drafted {k1[0]['draft']})"
+      f"   two at once: {kw2:6.1f} s -> {kw1 / kw2:.2f}x, {sum(r['n'] for r in k2) / kw2:.1f} tok/s total")
 
 if a.quick:
     raise SystemExit
