@@ -24,6 +24,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import diffpage
 import reportui
 from telemetry import (prompt_tokens, result, task_title, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
                        guess_task, harness_runs, ledger, log_runs, ollama_requests, read_session)
@@ -257,6 +258,15 @@ def build(log, sid, trigger, run=None):
     else:
         task, cs = guess_task(project, t0, t1)
         spec = None
+    diff_start, diff_end = start, end
+    if not start and cs:   # no harness lines: the commits made during the session
+        pdir = ROOT / "projects" / project
+        first, last = cs[-1].split()[0], cs[0].split()[0]
+        diff_start = {"project": project, "run": f"s-{sid[:8]}", "task": task, "worker": worker,
+                      "base": subprocess.run(["git", "-C", str(pdir), "rev-parse", "-q", "--verify", first + "^"],
+                                             capture_output=True, text=True).stdout.strip()}
+        diff_end = {"head": subprocess.run(["git", "-C", str(pdir), "rev-parse", last], capture_output=True,
+                                           text=True).stdout.strip(), "task_state": "done" if task else "open"}
     # The window each request really had (Ollama logs it), else what the harness was configured with.
     window = max((r["n_ctx"] for r in reqs), default=None) or (start or {}).get("num_ctx") or config("NUM_CTX", 131072)
     peak = max(c["total"] for c in a["calls"])
@@ -333,15 +343,31 @@ def build(log, sid, trigger, run=None):
     out_dir = REPORTS / project
     out_dir.mkdir(parents=True, exist_ok=True)
     name = f"{begun.strftime('%Y%m%d-%H%M')}-{'' if worker == 'main' else worker + '-'}{sid[:8]}-{trigger}"
+    try:   # the code this run changed, on its own page
+        data["diff"] = diff_start and diffpage.build(diff_start, diff_end, out_dir / f"{name}.html")
+    except Exception as e:   # never cost us the run report
+        print(f"diff page: {e!r}", file=sys.stderr)
+        data["diff"] = None
     (out_dir / f"{name}.html").write_text(reportui.page(data["title"][:80], data, TEMPLATE_JS))
     summary = {k: data[k] for k in ("title", "spec", "project", "worker", "tag", "start", "trigger", "merged", "result",
-                                    "note", "attempt")} | {
+                                    "note", "attempt", "diff")} | {
         "run": (start or {}).get("run"), "share_pct": share and share["mine_pct"]} | {
         k: data["stats"][k] for k in ("wall_min", "turns", "peak_pct", "think_pct", "gen_tps", "util_avg", "outcome",
                                       "compactions", "retries")}
     (out_dir / f"{name}.json").write_text(json.dumps(summary))
     build_index()
     return out_dir / f"{name}.html"
+
+
+def diff_cell(d, live=False, run=None, project=None):
+    if live and (REPORTS / project / "diffs" / f"{run}.html").exists():
+        return f'<a href="{project}/diffs/{run}.html">so far</a>'
+    if not d:
+        return "–"
+    if not d["files"]:
+        return f'<a href="{d["path"]}" class="note">none</a>'
+    return (f'<a href="{d["path"]}" title="view the diff">{d["files"]} file{"s" if d["files"] != 1 else ""}</a>'
+            f'<div class="note"><span style="color:var(--c3)">+{d["add"]}</span> <span class="bad">−{d["del"]}</span></div>')
 
 
 def build_index():
@@ -354,6 +380,23 @@ def build_index():
         if k not in runs or s["trigger"] == "end" or runs[k][1]["trigger"] != "end":
             runs[k] = (f, s)
     rows = []
+    # Runs still going, newest first, above the reports (a run gets its report when it ends or compacts).
+    live_all = diffpage.live_runs()
+    live_ids = {r["start"]["run"] for r in live_all}
+    live = [r for r in live_all if r["start"]["run"] not in runs]
+    for r in sorted(live, key=lambda r: -r["start"]["t"]):
+        st = r["start"]
+        d = REPORTS / st["project"] / "diffs" / f'{st["run"]}.html'
+        title, spec = task_title(st.get("task") or "", st["project"]) if st.get("task") else ("(no task)", "")
+        so_far = f'<a href="{st["project"]}/diffs/{d.name}">so far</a>' if d.exists() else "–"
+        rows.append(
+            f'<tr><td class="num">{datetime.fromtimestamp(st["t"]).strftime("%Y-%m-%d %H:%M")}</td>'
+            f'<td>{html.escape(agent_tag(st) or st["project"])}</td>'
+            f'<td><span title="{html.escape(spec or "")}">{html.escape(short(("Merge fix: " if st.get("merge_fix") else "") + title, 90))}</span></td>'
+            f'<td>{"continued" if st.get("resumed") else ""}</td><td><b>… running</b>'
+            f'<div class="note">for {(time.time() - st["t"]) / 60:.0f} min; report when it ends</div></td>'
+            f'<td class="num">{so_far}</td>'
+            f'<td class="num">{(time.time() - st["t"]) / 60:.1f}</td>' + '<td class="num">–</td>' * 5 + '</tr>')
     for k, (f, s) in sorted(runs.items(), key=lambda kv: (kv[1][1]["start"], kv[1][0].name), reverse=True):
         who = s.get("tag") or s["project"]
         r = s.get("result") or {"label": s["outcome"], "cls": "", "why": ""}
@@ -370,6 +413,7 @@ def build_index():
             f'<td>{tries}</td>'
             f'<td><span class="{r["cls"]}" title="{html.escape(r["why"])}"><b>{html.escape(r["label"])}</b></span>'
             f'<div class="note">{html.escape(r["why"])}{" · " + " · ".join(side) if side else ""}</div></td>'
+            f'<td class="num">{diff_cell(s.get("diff"), live=s.get("run") in live_ids, run=s.get("run"), project=s["project"])}</td>'
             f'<td class="num">{s["wall_min"]}</td><td class="num">{s["turns"]}</td>'
             f'<td class="num">{s["peak_pct"]}%</td><td class="num">{s["think_pct"]}%</td>'
             f'<td class="num">{s["gen_tps"] and round(s["gen_tps"], 1)}</td>'
@@ -424,7 +468,7 @@ INDEX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  interrupted / split / merge fix), not whether the Claude session ended cleanly; when a task was not finished the
  agent's own note says why and what would have helped.
  · <a href="fleet.html"><b>Fleet view</b></a>: every agent on one timeline, and how they share the GPUs</div>
-<section class="card" style="overflow-x:auto"><table><tr><th>Start</th><th>Agent</th><th>Task</th><th>Attempt</th><th>Result</th>
+<section class="card" style="overflow-x:auto"><table><tr><th>Start</th><th>Agent</th><th>Task</th><th>Attempt</th><th>Result</th><th class="num">Changes</th>
 <th class="num">Min</th><th class="num">Turns</th><th class="num">Peak ctx</th><th class="num">Thinking</th>
 <th class="num">Gen t/s</th><th class="num">GPU share %</th></tr>
 __ROWS__</table></section></main></body></html>"""
@@ -438,6 +482,7 @@ const merge={yes:'merged',conflict:'<span class="warn">merge conflict</span>',pa
 let h=`<h1>${esc(D.title)}</h1>${D.spec&&D.spec!==D.title?`<div class="note" style="max-width:900px;margin:-4px 0 8px">${esc(D.spec)}</div>`:''}<div class="sub">${who} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
 h+='<div class="tiles">'+[
  tile('Peak context',k(S.peak),`${pk}% of ${k(D.window)} window${S.real_peak?` · the server saw ${k(S.real_peak)}`:''}`,pkc),
+ D.diff?tile('Changes',`<a href="../${esc(D.diff.path)}">${D.diff.files} file${D.diff.files==1?'':'s'}</a>`,`<span style="color:var(--c3)">+${D.diff.add}</span> <span class="bad">−${D.diff.del}</span> · <a href="../${esc(D.diff.path)}">view the diff</a>`):'',
  tile('Thinking share',S.think_pct+'%','of all context growth'),
  tile('Turns',S.turns,`${S.compactions} compaction${S.compactions==1?'':'s'} · ${S.retries} retr${S.retries==1?'y':'ies'}`,S.retries?'warn':''),
  D.result?tile('Result',esc(D.result.label),esc(D.result.why)+(D.attempt&&D.attempt.n>1?` · attempt ${D.attempt.n}`:'')+` · session: ${esc(S.outcome)}`,D.result.cls):
@@ -484,7 +529,7 @@ h+='<div class="grid3">'+card('GPU utilization','% per GPU, 5 s samples','<div i
 h+='<div class="grid2">'+card('Tools','Result tokens are what each tool added to the context',
  '<table><tr><th>Tool</th><th class="num">Calls</th><th class="num">Tokens</th><th class="num">Per call</th></tr>'+
  D.tools.map(t=>`<tr><td>${esc(t.name)}</td><td class="num">${t.calls}</td><td class="num">${k(t.tokens)}</td><td class="num">${k(t.calls?t.tokens/t.calls:0)}</td></tr>`).join('')+'</table>')
- +card('Commits during the run',D.commits.length?'':'none','<ul class="commits mono">'+D.commits.map(c=>`<li>${esc(c)}</li>`).join('')+'</ul>')+'</div>';
+ +card('Commits during the run',D.diff?`<a href="../${esc(D.diff.path)}">Full diff of this run →</a>`:D.commits.length?'':'none','<ul class="commits mono">'+D.commits.map(c=>`<li>${esc(c)}</li>`).join('')+'</ul>')+'</div>';
 
 h+=card('Per-turn data','','<details><summary>Turn-by-turn table ('+D.calls.length+' rows)</summary><div class="scroll"><table><tr><th class="num">Turn</th><th class="num">Min</th><th class="num">Context</th><th class="num">Δ</th><th>Largest addition</th></tr>'+
  D.calls.map(c=>`<tr><td class="num">${c.turn}</td><td class="num">${f1(c.min)}</td><td class="num">${k(c.total)}</td><td class="num">${c.delta>=0?'+':''}${k(c.delta)}</td><td>${esc(c.added)}</td></tr>`).join('')+'</table></div></details>'+

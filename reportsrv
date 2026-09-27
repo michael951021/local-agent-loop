@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# The reports as a website on your local network (no more rsync): http://<this machine>:REPORTS_PORT/
+#
+#   ./reportsrv start      install + start the user service (restarts on failure, starts at login)
+#   ./reportsrv stop       stop and disable it
+#   ./reportsrv status     is it up, and the URLs to open
+#   ./reportsrv logs [-f]
+#
+# Read-only, answers private/loopback addresses only. If ufw is on, allow the LAN once:
+#   sudo ufw allow from 192.168.0.0/16 to any port 8765 proto tcp
+# To keep it running while you are logged out: sudo loginctl enable-linger $USER
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+source "$ROOT/config.env"
+: "${REPORTS_PORT:=8765}"
+UNIT=agent-reports
+UFILE="$HOME/.config/systemd/user/$UNIT.service"
+
+urls() {
+  echo "  http://$(hostname).local:$REPORTS_PORT/"
+  ip -4 -o addr show scope global | awk -v p="$REPORTS_PORT" '{split($4,a,"/"); print "  http://" a[1] ":" p "/"}'
+}
+
+case "${1:-}" in
+  start)
+    mkdir -p "$(dirname "$UFILE")"
+    cat > "$UFILE" <<EOF
+[Unit]
+Description=Agent run reports on the local network (loop harness)
+
+[Service]
+ExecStart=/usr/bin/python3 $ROOT/reportsrv.py --port $REPORTS_PORT
+WorkingDirectory=$ROOT
+Restart=on-failure
+Nice=10
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable -q "$UNIT"
+    systemctl --user restart "$UNIT"
+    sleep 1
+    curl -sf -o /dev/null "http://127.0.0.1:$REPORTS_PORT/" || { journalctl --user -u "$UNIT" -n 20 --no-pager; exit 1; }
+    echo "reports are up:"; urls ;;
+  stop) systemctl --user disable -q --now "$UNIT" && echo "stopped $UNIT" ;;
+  status) systemctl --user is-active "$UNIT" && urls || true ;;
+  logs) shift; journalctl --user -u "$UNIT" --no-pager "$@" ;;
+  *) sed -n 2,12p "$0"; exit 1 ;;
+esac

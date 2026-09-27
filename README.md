@@ -83,14 +83,23 @@ Requests a server rejects are saved in `logs/requests/failed/`.
 
 Every run gets `reports/<project>/<time>-[<agent>-]<session>-end.html` (and one per context
 compaction); `reports/index.html` lists them and `reports/fleet.html` shows all agents on one
-timeline with their share of the GPUs. Copy the folder anywhere to view it: the pages are
-self-contained.
+timeline with their share of the GPUs. Each run also gets a diff page,
+`reports/<project>/diffs/<run>.html`: every file it changed, line by line, with its commits
+(merge-conflict fixes show only the resolution; a run still going shows its work so far,
+uncommitted files included). `./diffpage.py --all` rebuilds them for past runs.
+
+**On your network:** `./reportsrv start` serves the reports at `http://<this machine>:8765/`
+(user service, starts at login). Pages reload themselves when they change, and opening the index
+refreshes it and the running agents' diffs, so there is nothing to sync. It answers only
+private/loopback addresses and is read-only. With ufw on, allow the LAN once:
+`sudo ufw allow from 192.168.0.0/16 to any port 8765 proto tcp`.
 
 | Layer | Files | Job |
 |---|---|---|
 | Record | `./agent` (harness lines in `logs/*.jsonl`), `keepalive.py` (`logs/requests/`), `gpumon.py` (`logs/gpu/`), Ollama's journal | write facts as they happen, tagged by agent |
 | Read | `telemetry.py` | parse and join them: runs, requests per agent, fair GPU share, VRAM split |
-| Render | `reportui.py`, `ctxreport.py`, `fleet.py` | per-run page, index, fleet page |
+| Render | `reportui.py`, `ctxreport.py`, `fleet.py`, `diffpage.py` | per-run page, index, fleet page, diff pages |
+| Serve | `reportsrv.py` (`./reportsrv`) | the folder on the LAN, live |
 | Trigger | `./agent` (end of run), `pretty.py` (compaction) | call the renderer; never block the agent |
 
 ## What the sandbox allows
