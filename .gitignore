@@ -1,0 +1,13 @@
+projects/
+logs/
+run/
+home/*
+!home/.claude/
+home/.claude/*
+!home/.claude/settings.json
+!home/.claude/CLAUDE.md
+!home/.claude/agents/
+secrets.env
+__pycache__/
+reports/
+*.new

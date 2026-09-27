@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# Sandboxed Claude Code agent on a local Ollama model.
+#
+#   ./agent setup                 build the Ollama model variant (run once / after config change)
+#   ./agent new   NAME            create projects/NAME (git repo + CLAUDE.md + TODO.md)
+#   ./agent chat  NAME            interactive Claude Code session in the sandbox
+#   ./agent loop  NAME [ITERS]    autonomous loop: work through TODO.md until done
+#   ./agent run   NAME "PROMPT"   one headless run with a custom prompt
+#   ./agent shell NAME            bash inside the sandbox (to poke around)
+#   ./agent list                  list projects
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# shellcheck source=config.env
+source "$ROOT/config.env"
+# Optional secrets passed into the sandbox (GH_TOKEN=...). Not committed.
+[[ -f "$ROOT/secrets.env" ]] && source "$ROOT/secrets.env"
+: "${MAX_STEP_ATTEMPTS:=0}" "${ITER_TIMEOUT:=0}"   # defaults for older config.env files
+
+SANDBOX_HOME="$ROOT/home"            # becomes /home/agent inside the sandbox
+PROJECTS="$ROOT/projects"
+LOGS="$ROOT/logs"
+RUN="$ROOT/run"
+CLAUDE_BIN="$(readlink -f "$(command -v claude)")"
+OLLAMA_PORT="${OLLAMA_URL##*:}"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+project_dir() {
+  [[ -n "${1:-}" ]] || die "project name required"
+  local dir="$PROJECTS/$1"
+  [[ -d "$dir" ]] || die "no project '$1' (create it with: ./agent new $1)"
+  echo "$dir"
+}
+
+check_ollama() {
+  curl -sf "$OLLAMA_URL/api/version" >/dev/null || die "Ollama not reachable at $OLLAMA_URL"
+  ollama list | awk '{print $1}' | grep -qx "$MODEL:latest" || die "model '$MODEL' missing — run: ./agent setup"
+}
+
+# sandbox PROJECT_DIR [--tty] -- CMD...
+# Filesystem: read-only system dirs, private $HOME (loop/home), only the project is writable.
+sandbox() {
+  local proj="$1"; shift
+  local tty=0
+  [[ "${1:-}" == "--tty" ]] && { tty=1; shift; }
+  [[ "${1:-}" == "--" ]] && shift
+
+  # Host-side proxy that pings slow streams, so Claude Code's 300 s idle watchdog doesn't abort
+  # long tool calls that Ollama is still generating (see keepalive.py).
+  mkdir -p "$RUN" "$LOGS"
+  local kafile ka_pid ka_port status=0
+  kafile="$(mktemp "$RUN/keepalive.XXXXXX")"
+  python3 "$ROOT/keepalive.py" 0 "127.0.0.1:$OLLAMA_PORT" > "$kafile" 2>>"$LOGS/keepalive.log" &
+  ka_pid=$!
+  for _ in {1..50}; do [[ -s "$kafile" ]] && break; sleep 0.1; done
+  ka_port="$(head -1 "$kafile")"; rm -f "$kafile"
+  [[ -n "$ka_port" ]] || { kill "$ka_pid" 2>/dev/null; die "keepalive proxy failed to start"; }
+  local api_port="$ka_port"; [[ "$NET" == "on" ]] || api_port="$OLLAMA_PORT"   # NET=off: bridge listens there
+
+  local args=(
+    --ro-bind /usr /usr
+    --symlink usr/bin /bin --symlink usr/sbin /sbin
+    --symlink usr/lib /lib --symlink usr/lib64 /lib64
+    --ro-bind /etc /etc
+    --ro-bind-try /run/systemd/resolve /run/systemd/resolve
+    --proc /proc --dev /dev
+    --tmpfs /tmp
+    --bind "$SANDBOX_HOME" /home/agent
+    --ro-bind "$CLAUDE_BIN" /opt/claude/claude
+    --ro-bind "$ROOT/prompts" /opt/agent/prompts
+    --ro-bind "$ROOT/hooks" /opt/agent/hooks
+    --ro-bind "$ROOT/bridge.py" /opt/agent/bridge.py
+    --ro-bind "$ROOT/mcp" /opt/agent/mcp
+    --bind "$proj" /work
+    --chdir /work
+    --unshare-all --hostname sandbox
+    --die-with-parent
+    --clearenv
+    --setenv HOME /home/agent
+    --setenv USER agent
+    --setenv PATH /home/agent/.local/bin:/opt/claude:/usr/local/bin:/usr/bin
+    --setenv TERM "${TERM:-xterm-256color}"
+    --setenv LANG "${LANG:-C.UTF-8}"
+    --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$api_port"
+    --setenv ANTHROPIC_AUTH_TOKEN ollama
+    --setenv ANTHROPIC_API_KEY ""
+    --setenv ANTHROPIC_MODEL "$MODEL"
+    --setenv ANTHROPIC_DEFAULT_OPUS_MODEL "$MODEL"
+    --setenv ANTHROPIC_DEFAULT_SONNET_MODEL "$MODEL"
+    --setenv ANTHROPIC_DEFAULT_HAIKU_MODEL "$MODEL"
+    --setenv CLAUDE_CODE_SUBAGENT_MODEL "$MODEL"
+    --setenv CLAUDE_CODE_MAX_CONTEXT_TOKENS "$NUM_CTX"
+    --setenv CLAUDE_CODE_AUTO_COMPACT_WINDOW "$NUM_CTX"
+    --setenv CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 1
+    --setenv CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK 1   # pings only help streams
+    --setenv DISABLE_AUTOUPDATER 1
+    --setenv GIT_AUTHOR_NAME agent --setenv GIT_AUTHOR_EMAIL agent@sandbox
+    --setenv GIT_COMMITTER_NAME agent --setenv GIT_COMMITTER_EMAIL agent@sandbox
+    --setenv NPM_CONFIG_PREFIX /home/agent/.local
+  )
+  [[ $tty == 0 ]] && args+=(--new-session)
+  # The token goes in through a 0600 file, not --setenv: bwrap's argv is visible to every user in `ps`.
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    mkdir -p "$RUN"
+    (umask 077; printf '%s' "$GH_TOKEN" > "$RUN/gh_token")
+    args+=(--ro-bind "$RUN/gh_token" /run/secrets/gh_token)
+    set -- bash -c 'export GH_TOKEN="$(</run/secrets/gh_token)"; exec "$@"' _ "$@"
+  fi
+
+  if [[ "$NET" == "on" ]]; then
+    args+=(--share-net)
+    bwrap "${args[@]}" "$@" || status=$?
+  else
+    # No network namespace access: tunnel only Ollama through a unix socket.
+    mkdir -p "$RUN"
+    local sock="$RUN/ollama.$$.sock"
+    python3 "$ROOT/bridge.py" out "$sock" "127.0.0.1:$ka_port" &
+    local bridge_pid=$!
+    for _ in {1..50}; do [[ -S "$sock" ]] && break; sleep 0.1; done
+    args+=(--bind "$sock" /run/ollama.sock)
+    bwrap "${args[@]}" bash -c \
+      "python3 /opt/agent/bridge.py in /run/ollama.sock $OLLAMA_PORT & sleep 0.3; exec \"\$@\"" _ "$@" \
+      || status=$?
+    kill "$bridge_pid" 2>/dev/null || true
+    rm -f "$sock"
+  fi
+  kill "$ka_pid" 2>/dev/null || true
+  return "$status"
+}
+
+claude_args=(--append-system-prompt-file /opt/agent/prompts/system.md --dangerously-skip-permissions)
+
+cmd_setup() {
+  curl -sf "$OLLAMA_URL/api/version" >/dev/null || die "Ollama not reachable at $OLLAMA_URL"
+  ollama list | awk '{print $1}' | grep -qx "$BASE_MODEL" || ollama pull "$BASE_MODEL"
+  printf 'FROM %s\nPARAMETER num_ctx %s\n' "$BASE_MODEL" "$NUM_CTX" > "$RUN/Modelfile"
+  ollama create "$MODEL" -f "$RUN/Modelfile"
+  echo "ready: $MODEL ($BASE_MODEL, ctx $NUM_CTX)"
+}
+
+cmd_new() {
+  local name="${1:-}"; [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "usage: ./agent new NAME"
+  local dir="$PROJECTS/$name"
+  [[ -e "$dir" ]] && die "project '$name' already exists"
+  cp -r "$ROOT/template" "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" add -A
+  git -C "$dir" -c user.name=agent -c user.email=agent@sandbox commit -qm "init project"
+  echo "created $dir"
+  echo "  1. describe the project in $dir/CLAUDE.md"
+  echo "  2. list tasks in $dir/TODO.md"
+  echo "  3. ./agent loop $name   (or ./agent chat $name)"
+}
+
+cmd_chat() {
+  local dir; dir="$(project_dir "${1:-}")"; check_ollama
+  sandbox "$dir" --tty -- claude "${claude_args[@]}"
+}
+
+cmd_shell() {
+  local dir; dir="$(project_dir "${1:-}")"
+  sandbox "$dir" --tty -- bash
+}
+
+# headless DIR PROMPT LOGFILE — one claude -p run, pretty-printed and logged
+headless() {
+  local dir="$1" prompt="$2" log="$3"
+  sandbox "$dir" -- timeout --kill-after=60 "$ITER_TIMEOUT" claude -p "$prompt" "${claude_args[@]}" \
+    --max-turns "$MAX_TURNS" --output-format stream-json --verbose \
+    < /dev/null | tee -a "$log" | python3 "$ROOT/pretty.py"
+}
+
+cmd_run() {
+  local dir; dir="$(project_dir "${1:-}")"; check_ollama
+  [[ -n "${2:-}" ]] || die "usage: ./agent run NAME \"PROMPT\""
+  mkdir -p "$LOGS"
+  headless "$dir" "$2" "$LOGS/$1-$(date +%Y%m%d-%H%M%S).jsonl"
+  autocommit "$dir" "agent run"
+}
+
+open_todos() { grep -cE '^\s*- \[ \]' "$1/TODO.md" 2>/dev/null || true; }
+
+autocommit() {
+  local dir="$1" msg="$2"
+  [[ -n "$(git -C "$dir" status --porcelain)" ]] || return 1
+  git -C "$dir" add -A
+  git -C "$dir" -c user.name=agent -c user.email=agent@sandbox commit -qm "$msg"
+}
+
+first_todo() { grep -m1 -E '^\s*- \[ \]' "$1" 2>/dev/null || true; }
+
+# A TODO.md line ending in "(checklist: PATH)" is a milestone. While PATH (relative to the project)
+# exists and has an unchecked line, that line is the task; otherwise the milestone line itself is.
+checklist_of() { sed -nE 's/.*\(checklist: ([^) ]+)\).*/\1/p' <<<"$1"; }
+
+cmd_loop() {
+  local name="${1:-}" dir; dir="$(project_dir "$name")"; check_ollama
+  local iters="${2:-$MAX_ITERS}" stuck=0 attempts=0 task="" prev_task=""
+  mkdir -p "$LOGS"
+  local log="$LOGS/$name-$(date +%Y%m%d-%H%M%S).jsonl"
+  trap 'echo; echo "stopped."; exit 130' INT
+  rm -f "$dir/DONE"
+  for ((i = 1; iters == 0 || i <= iters; i++)); do
+    local todo; todo="$(open_todos "$dir")"
+    if [[ -f "$dir/DONE" || "$todo" == 0 ]]; then
+      echo "✔ all tasks done"; break
+    fi
+    local src="TODO.md" parent="" cl sub
+    task="$(first_todo "$dir/TODO.md")"
+    cl="$(checklist_of "$task")"
+    if [[ -n "$cl" && -f "$dir/$cl" ]]; then
+      sub="$(first_todo "$dir/$cl")"
+      [[ -n "$sub" ]] && { parent="$task"; task="$sub"; src="$cl"; }
+    fi
+    if [[ "$task" == "$prev_task" ]]; then attempts=$((attempts + 1)); else attempts=1; prev_task="$task"; fi
+    if ((MAX_TASK_ATTEMPTS > 0 && attempts > MAX_TASK_ATTEMPTS)); then
+      echo "✖ gave up after $MAX_TASK_ATTEMPTS attempts on: $task"; break
+    fi
+    # A checklist step that keeps failing: tell the agent to take the checklist's failure path,
+    # and stop the loop if it still doesn't move on.
+    if [[ -n "$parent" ]] && ((MAX_STEP_ATTEMPTS > 0 && attempts > MAX_STEP_ATTEMPTS + 2)); then
+      echo "✖ checklist step still open after the abandon instruction: $task"; break
+    fi
+    local before; before="$(git -C "$dir" rev-parse HEAD)"
+    local of="$iters"; ((iters == 0)) && of="∞"
+    local cap="$MAX_TASK_ATTEMPTS"; ((cap == 0)) && cap="∞"
+    echo -e "\n\033[1m━━ iteration $i/$of — $todo open — attempt $attempts/$cap ━━\033[0m"
+    [[ -n "$parent" ]] && echo -e "\033[2m$src ← ${parent:0:100}\033[0m"
+    echo -e "\033[2m$task\033[0m"
+    local prompt; prompt="$(cat "$ROOT/prompts/loop.md")"
+    prompt+=$'\n\n'"## Your task ($src line $(grep -n -m1 -F -- "$task" "$dir/$src" | cut -d: -f1))"$'\n'"$task"
+    if [[ -n "$cl" && -z "$parent" ]]; then
+      prompt+=$'\n\n'"This is a milestone line and $cl does not exist or has no open steps. Do what the line says for that case. Check the milestone only when the line tells you to; after creating a checklist, leave it unchecked."
+    elif [[ -n "$parent" ]]; then
+      prompt+=$'\n\n'"This is one step of the checklist $src, under this TODO.md milestone (leave the milestone unchecked unless the step says to check it):"$'\n'"$parent"$'\n'"Read the Rules and On failure sections at the top of $src first."
+    fi
+    prompt+=$'\n\n'"## Coming next (for context only, do not do these)"$'\n'"$(grep -E '^\s*- \[ \]' "$dir/$src" | sed -n '2,3p')"
+    if ((attempts > 1)); then
+      prompt+=$'\n\n'"This is attempt $attempts at this task; earlier attempts did not finish it. Read NOTES.md for what was tried and why it failed, and try a different approach. Record this attempt's outcome in NOTES.md."
+    fi
+    if [[ -n "$parent" ]] && ((MAX_STEP_ATTEMPTS > 0 && attempts > MAX_STEP_ATTEMPTS)); then
+      prompt+=$'\n\n'"This step has now failed $((attempts - 1)) times. Do not attempt it again: follow the On failure section of $src (use reason STEP_FAILED if no other reason fits), then stop."
+    fi
+    headless "$dir" "$prompt" "$log" || echo "(run exited non-zero)"
+    autocommit "$dir" "loop iteration $i" || true
+    if [[ "$(git -C "$dir" rev-parse HEAD)" == "$before" ]]; then
+      stuck=$((stuck + 1))
+      echo "no changes this iteration ($stuck/${STUCK_LIMIT/#0/∞})"
+      ((STUCK_LIMIT > 0 && stuck >= STUCK_LIMIT)) && { echo "✖ agent seems stuck — stopping"; break; }
+    else
+      stuck=0
+    fi
+  done
+  echo "log: $log"
+  git -C "$dir" log --oneline -10
+}
+
+cmd_list() { ls -1 "$PROJECTS" 2>/dev/null; }
+
+mkdir -p "$SANDBOX_HOME" "$PROJECTS" "$LOGS" "$RUN"
+sub="${1:-}"; shift || true
+case "$sub" in
+  setup) cmd_setup "$@" ;;
+  new)   cmd_new "$@" ;;
+  chat)  cmd_chat "$@" ;;
+  loop)  cmd_loop "$@" ;;
+  run)   cmd_run "$@" ;;
+  shell) cmd_shell "$@" ;;
+  list)  cmd_list ;;
+  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
