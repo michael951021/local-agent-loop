@@ -125,7 +125,9 @@ def build(hours=24):
         "stats": {"agents": len(agents), "runs": len(runs), "finished": sum(1 for r in runs if r["end"]),
                   "merged": sum(p["merged"] for p in per.values()), "conflicts": sum(p["conflicts"] for p in per.values()),
                   "requests": len(reqs), "gen_tok": gen_tok, "agg_tps": round(gen_tok / busy, 1) if busy else None,
-                  "busy_pct": round(100 * busy / (now - t0), 1), "overlap_pct": round(100 * overlap / busy, 1) if busy else 0,
+                  "busy_pct": round(100 * busy / (now - t0), 1),
+                  "reuse_pct": round(100 * sum(r["reused"] for r in reqs) / max(1, sum(r["prompt"] for r in reqs)), 1),
+                  "servers": sorted({r["server"] for r in reqs}), "overlap_pct": round(100 * overlap / busy, 1) if busy else 0,
                   "util_avg": round(sum(util) / len(util)) if util else None,
                   "energy_kwh": round(sum(power) * BUCKET / 3600 / 1000, 2) if power else None},
         "built": time.strftime("%Y-%m-%d %H:%M"),
@@ -138,11 +140,12 @@ const clock=v=>{const d=new Date((D.t0+v*60)*1000);return d.getHours().toString(
 const hrs=s=>s>=3600?(s/3600).toFixed(1)+' h':Math.round(s/60)+' min';
 let h=`<h1>Agent fleet</h1><div class="sub">Last ${mins(D.span_min)} · built ${D.built} · ${D.live.length?'running now: <b>'+D.live.map(esc).join(', ')+'</b>':'no agents running'} · <a href="index.html">all reports</a></div>`;
 h+='<div class="tiles">'+[
- tile('Agents',S.agents,`${D.slots} Ollama slot${D.slots>1?'s':''} in use`),
+ tile('Agents',S.agents,`${D.slots} model slot${D.slots>1?'s':''} in use · ${S.servers.map(esc).join(' + ')||'–'}`),
  tile('Runs',S.runs,`${S.finished} finished · ${S.merged} with changes merged`),
  tile('Merge conflicts',S.conflicts,S.conflicts?'resolved by the agent on its next run':'none',S.conflicts?'warn':''),
  tile('GPU busy',S.busy_pct+'%',`of the time · 2+ requests at once ${S.overlap_pct}% of busy time`),
  tile('Throughput',S.agg_tps!=null?f1(S.agg_tps)+' t/s':'–',`${k(S.gen_tok)} tokens generated, all agents`),
+ tile('Prompt cache',S.reuse_pct+'%',`of prompt tokens reused, not re-read`,S.reuse_pct<50?'warn':''),
  tile('GPU util',S.util_avg!=null?S.util_avg+'%':'–',S.energy_kwh!=null?`average · ${S.energy_kwh} kWh`:'average'),
 ].join('')+'</div>';
 h+=card('Timeline','One lane per agent. Pale bars are runs (click one for its report); solid segments are model requests, with the faded head spent reading the prompt.',
@@ -152,7 +155,7 @@ h+=card('Requests in flight','Model requests running at once, per agent, average
 const V=D.vram;
 if(V){const gib=m=>m/1024,cap=D.gpu.cap_gb||gib(V.weights+V.kv+V.recurrent+V.compute),free=Math.max(0,cap-gib(V.weights+V.kv+V.recurrent+V.compute)),
  parts=[['Model weights',gib(V.weights),col(0)],[`KV cache · ${V.slots} slot${V.slots>1?'s':''} × ${k(V.ctx_slot)} tokens`,gib(V.kv),col(1)],['Recurrent state',gib(V.recurrent),col(2)],['Compute buffers',gib(V.compute),col(3)],['Free',free,'var(--grid)']];
- h+=card('How the model uses VRAM',`From Ollama's last model load, across all GPUs (${f1(cap)} GB). Each slot owns its own KV cache; weights are shared.`,
+ h+=card('How the model uses VRAM',`From the model server's last load, across all GPUs (${f1(cap)} GB). Each slot owns its own KV cache; weights are shared.`,
  '<div class="bar100">'+parts.map(p=>`<div style="flex:${p[1]};background:${p[2]}" data-t="${esc(p[0])}: ${f1(p[1])} GB"></div>`).join('')+'</div>'+legend(parts.map(p=>({n:`${p[0]} ${f1(p[1])} GB`,c:p[2]}))))}
 const gid=D.gpu.ids.map((g,i)=>({n:'GPU '+g,c:col(i)}));
 h+='<div class="grid3">'+card('GPU utilization','% per GPU, 1-minute average','<div id="gu"></div>'+legend(gid))

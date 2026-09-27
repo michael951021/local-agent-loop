@@ -114,14 +114,27 @@ RX = {
 
 
 def journal(t0, t1, grep=None):
-    args = ["journalctl", "-u", "ollama", "--no-pager", "-o", "short-unix",
-            "--since", f"@{int(t0)}", "--until", f"@{int(t1)}"]
-    if grep:
-        args += ["-g", grep]
-    try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=180).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
+    """Log lines of every model server in [t0, t1], merged by time: Ollama's system unit and the
+    llama-server user unit started by ./llamasrv (same llama.cpp log format)."""
+    out = []
+    for scope in (["-u", "ollama"], ["--user", "-u", "llama-agent"]):
+        args = ["journalctl", *scope, "--no-pager", "-o", "short-unix",
+                "--since", f"@{int(t0)}", "--until", f"@{int(t1)}"]
+        if grep:
+            args += ["-g", grep]
+        try:
+            out += subprocess.run(args, capture_output=True, text=True, timeout=180).stdout.splitlines()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    out.sort(key=lambda l: l.split(" ", 1)[0])
+    return "\n".join(out)
+
+
+def prompt_tokens(usage):
+    """Whole prompt size from Anthropic-style usage. Ollama puts it all in input_tokens; llama-server
+    (and Anthropic) count cached tokens separately in cache_read/cache_creation_input_tokens."""
+    u = usage or {}
+    return sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
 
 
 def ollama_requests(t0, t1):
@@ -137,13 +150,14 @@ def ollama_requests(t0, t1):
             m = rx.search(line)
             if not m:
                 continue
+            proc = line.split(" ", 3)[2]   # e.g. ollama[170211]: task ids restart per server process
             if kind == "start":
-                reqs[m.group(2)] = {"t": t, "slot": int(m.group(1)), "n_ctx": int(m.group(3)), "prompt": int(m.group(4)),
+                reqs[proc + m.group(2)] = {"t": t, "slot": int(m.group(1)), "n_ctx": int(m.group(3)), "prompt": int(m.group(4)),
                                     "processed": None,
                                     "prefill_s": None, "gen": 0, "gen_s": 0.0, "tps": None, "full": False,
-                                    "cancelled": False, "end": None}
+                                    "cancelled": False, "end": None, "server": proc.split("[")[0]}
                 break
-            r = reqs.get(m.group(1))
+            r = reqs.get(proc + m.group(1))
             if not r:
                 break
             if kind == "full":
@@ -233,12 +247,12 @@ def attribute(reqs, rows):
     free = list(rows)
     for r in reqs:
         cands = [e for e in free if e["t0"] - 1.5 <= r["t"] <= e.get("t1", r["t"]) + 1]
-        if len(cands) > 1 and all(e.get("input_tokens") for e in cands):
-            cands.sort(key=lambda e: abs(r["prompt"] - e["input_tokens"] - 5000))
+        if len(cands) > 1 and all(prompt_tokens(e) for e in cands):
+            cands.sort(key=lambda e: abs(r["prompt"] - prompt_tokens(e) - 5000))
         if cands:
             e = cands[0]
             free.remove(e)
-            r["tag"], r["input_tokens"] = e["tag"], e.get("input_tokens")
+            r["tag"], r["input_tokens"] = e["tag"], prompt_tokens(e) or None
         else:
             r["tag"] = "other clients"
     return reqs

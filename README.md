@@ -46,15 +46,37 @@ branch `agent/wK`, and they split up TODO.md:
   databases) are mounted into every agent's sandbox from the main checkout.
 - **Tmux.** Each agent gets a pane (the current window if you are in tmux, else a new session).
 
+- **Stopping mid-task.** `stop --now` interrupts the runs: each agent's session is resumed once,
+  without tools, to write a 2-line handoff (≤ 60 words: what is done and how it works / what is
+  left). The work is committed on the agent's branch, not merged, and the same agent continues
+  that task next time with the handoff in its prompt. A run cut off by `ITER_TIMEOUT` is paused
+  the same way; after `stop --kill`, a crash or a reboot the handoff is written when the agent
+  starts again.
+
 ```bash
-./agent status contrib-loop       # who is on what, and what each open task waits for
-./agent stop contrib-loop         # stop after the current tasks (--now: immediately)
+./agent status contrib-loop       # who is on what, paused tasks and their handoffs, what each task waits for
+./agent stop contrib-loop         # stop after the current tasks (--now: interrupt with a handoff; --kill)
 ./agent worker contrib-loop       # add one more agent to a running loop
 AGENTS=1 ./agent loop other       # a second, single-agent loop on another project
 ```
 
-Ollama must serve `NUM_PARALLEL` requests at once; `./agent setup` checks the systemd setting and
-prints the one root command that changes it. Each slot owns a KV cache of `NUM_CTX` tokens.
+### Model server (`BACKEND` in config.env)
+
+Ollama runs this model (architecture `qwen35`, part attention and part recurrent) one request at a
+time, whatever `OLLAMA_NUM_PARALLEL` says, and reuses almost none of the previous prompt. So
+`BACKEND=llama` (the default) serves the same GGUF with the `llama-server` that ships inside
+Ollama, as a user systemd unit, with no root needed:
+
+```bash
+./llamasrv start | stop | status | logs [-f]   # ./agent starts it by itself when needed
+```
+
+It unloads the model from Ollama first (both copies do not fit). `NUM_PARALLEL` slots of `NUM_CTX`
+tokens each; context checkpoints (kept in host RAM) let each slot reuse its previous prompt, so a
+turn only processes the new tokens. `chat_template.py` patches the model's template to accept the
+mid-conversation system messages Claude Code sends. `BACKEND=ollama` switches back (stop the
+server first); with Ollama, `./agent setup` checks the systemd `OLLAMA_NUM_PARALLEL` setting.
+Requests a server rejects are saved in `logs/requests/failed/`.
 `tests/smoke.sh` exercises all of this with a fake `claude` in about a minute.
 
 ## Reports

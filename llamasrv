@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Run the agent model on llama.cpp's llama-server (the one Ollama ships) instead of Ollama, so N agents
+# get N real slots: Ollama 0.33 refuses parallel requests for qwen35 (hybrid attention/recurrent) models.
+#
+#   ./llamasrv start [extra llama-server args]   unload the model from Ollama, start the server (user unit)
+#   ./llamasrv stop                              stop it (Ollama loads the model again on its next request)
+#   ./llamasrv status                            unit state, slots, VRAM
+#   ./llamasrv logs [-f]                         the server log (journalctl --user -u llama-agent)
+#
+# Settings come from config.env: MODEL (served under that name), BASE_MODEL (whose GGUF is used),
+# NUM_CTX (per slot), NUM_PARALLEL (slots), LLAMA_URL, LLAMA_ARGS (extra flags). No root needed.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+source "$ROOT/config.env"
+: "${NUM_PARALLEL:=1}" "${LLAMA_URL:=http://127.0.0.1:11500}" "${LLAMA_ARGS:=}"
+BIN="${LLAMA_SERVER:-/usr/local/lib/ollama/llama-server}"
+CUDA_DIR="${LLAMA_CUDA_DIR:-$(dirname "$BIN")/cuda_v13}"   # Ollama keeps the CUDA backend in a subdirectory
+UNIT=llama-agent
+
+die() { echo "error: $*" >&2; exit 1; }
+
+gguf() {   # the model weights blob of BASE_MODEL (first FROM of its Modelfile)
+  ollama show "$BASE_MODEL" --modelfile | awk '/^FROM \//{print $2; exit}'
+}
+
+cmd_start() {
+  mkdir -p "$ROOT/run"; exec 9>"$ROOT/run/llamasrv.lock"; flock 9   # agents starting together start it once
+  curl -sf "$LLAMA_URL/health" >/dev/null && { echo "$UNIT already running ($LLAMA_URL)"; return; }
+  systemctl --user is-active -q "$UNIT" && { echo "$UNIT is running but not healthy (./llamasrv logs)"; return 1; }
+  local model; model="$(gguf)"; [[ -r "$model" ]] || die "cannot read the GGUF of $BASE_MODEL ($model)"
+  # Free the GPUs: both copies of a 27B model do not fit.
+  for m in $(ollama ps | awk 'NR>1{print $1}'); do ollama stop "$m"; done
+  local port="${LLAMA_URL##*:}" tpl="$ROOT/run/chat-template.jinja"
+  python3 "$ROOT/chat_template.py" "$model" > "$tpl"   # the GGUF's template, patched for Claude Code
+  # Each slot gets exactly NUM_CTX tokens (no unified pool one agent could fill); context checkpoints let a
+  # hybrid model reuse the unchanged start of a prompt, and --cache-ram keeps more of them in host RAM.
+  systemd-run --user --unit="$UNIT" --collect --quiet \
+    -p KillMode=mixed -p TimeoutStopSec=30 \
+    --setenv=LD_LIBRARY_PATH="$CUDA_DIR:$(dirname "$BIN")" --setenv=GGML_BACKEND_PATH="$CUDA_DIR/libggml-cuda.so" \
+    "$BIN" --model "$model" --alias "$MODEL" --host 127.0.0.1 --port "$port" \
+      -c "$((NUM_CTX * NUM_PARALLEL))" -np "$NUM_PARALLEL" --no-kv-unified \
+      -ngl 999 --flash-attn on --jinja --chat-template-file "$tpl" --no-mmproj --metrics --no-webui \
+      --log-verbosity 4 --no-log-prefix --no-log-timestamps \
+      --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 \
+      --cache-ram 32768 --ctx-checkpoints 32 \
+      $LLAMA_ARGS "$@"
+  printf 'loading %s (%s slots x %s ctx) on %s ' "$MODEL" "$NUM_PARALLEL" "$NUM_CTX" "$LLAMA_URL"
+  for _ in $(seq 300); do
+    if curl -sf "$LLAMA_URL/health" >/dev/null; then echo " ready"; return; fi
+    systemctl --user is-active -q "$UNIT" || { echo; journalctl --user -u "$UNIT" -n 30 --no-pager; die "server exited"; }
+    printf .; sleep 1
+  done
+  die "not ready after 5 min (./llamasrv logs)"
+}
+
+cmd_stop() { systemctl --user stop "$UNIT" 2>/dev/null && echo "stopped $UNIT" || echo "$UNIT not running"; }
+
+cmd_status() {
+  systemctl --user status "$UNIT" --no-pager -n 0 2>/dev/null | head -4 || echo "$UNIT not running"
+  curl -sf "$LLAMA_URL/slots" | python3 -c '
+import json, sys
+for s in json.load(sys.stdin):
+    print(f"  slot {s[\"id\"]}: n_ctx {s[\"n_ctx\"]}, {\"busy\" if s.get(\"is_processing\") else \"idle\"}")' 2>/dev/null || true
+  nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader | sed 's/^/  gpu /'
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "$@" ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  logs) shift; journalctl --user -u "$UNIT" --no-pager -o short-iso "$@" ;;
+  *) sed -n 2,11p "$0"; exit 1 ;;
+esac

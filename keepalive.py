@@ -10,7 +10,8 @@ Pings never complete a block or a message, so nothing runs early. They stop afte
 so a request that is truly stuck still times out.
 
 Every /v1/messages request is also appended to logs/requests/YYYYMMDD.jsonl with TAG (the agent it
-belongs to), its timing and token usage, so reports can attribute Ollama's GPU time per agent.
+belongs to), its timing and token usage, so reports can attribute Ollama's GPU time per agent. The bodies of requests the server rejects
+(status >= 400) are kept in logs/requests/failed/ (the last 20).
 """
 import asyncio
 import json
@@ -24,7 +25,7 @@ IDLE = 20        # seconds of upstream silence before a ping
 MAX_AGE = 1800   # no pings for requests older than this
 PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 LEDGER = Path(__file__).resolve().parent / "logs" / "requests"
-USAGE = re.compile(rb'"(input_tokens|output_tokens)":\s*(\d+)')
+USAGE = re.compile(rb'"(input_tokens|output_tokens|cache_read_input_tokens|cache_creation_input_tokens)":\s*(\d+)')
 
 
 def log(msg):
@@ -64,6 +65,18 @@ def record(entry):
             f.write(json.dumps(entry) + "\n")
     except OSError as e:
         log(f"ledger: {e!r}")
+
+
+def save_failed(body, entry):
+    try:
+        d = LEDGER / "failed"
+        d.mkdir(parents=True, exist_ok=True)
+        old = sorted(d.glob("*.json"))
+        for f in old[:-20]:   # keep the last 20
+            f.unlink()
+        (d / f"{time.strftime('%Y%m%d-%H%M%S')}-{entry['status']}-{entry['tag'].replace('/', '_')}.json").write_bytes(body)
+    except OSError as e:
+        log(f"failed-request dump: {e!r}")
 
 
 async def relay_sse(up_r, headers, client_w, start, usage):
@@ -116,6 +129,8 @@ async def handle(client_r, client_w, upstream, tag):
         status, lines, headers = await read_head(up_r)
         if entry:
             entry["status"], entry["ttfb"] = int(status.split(" ")[1]), round(time.monotonic() - start, 3)
+            if entry["status"] >= 400:   # keep the request, to see what the server choked on
+                save_failed(body, entry)
         sse = headers.get("content-type", "").startswith("text/event-stream")
         # SSE is re-sent de-chunked and close-delimited; anything else passes through as is.
         drop = {"connection", "keep-alive"} | ({"transfer-encoding", "content-length"} if sse else set())

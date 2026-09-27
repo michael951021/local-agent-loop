@@ -9,7 +9,7 @@ Writes reports/<project>/<start>-[<agent>-]<sid8>-<trigger>.html, then refreshes
 and reports/fleet.html. ./agent runs it at the end of every run (--run); pretty.py on each compaction.
 Data comes from telemetry.py, the page look from reportui.py.
 
-Context attribution: each API call reports the real prompt size (usage.input_tokens). The growth
+Context attribution: each API call reports the real prompt size (usage input + cache read/creation). The growth
 between two calls is split across what was added in between (tool results, tool inputs, thinking,
 replies) in proportion to their character counts, so totals are exact and splits are estimates.
 """
@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 import reportui
-from telemetry import (LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
+from telemetry import (prompt_tokens, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
                        guess_task, harness_runs, ledger, log_runs, ollama_requests, read_session)
 
 REPORTS = ROOT / "reports"
@@ -122,7 +122,7 @@ def analyse(events):
             m = d["message"]
             if m.get("id") != last_mid:
                 last_mid = m.get("id")
-                settle((m.get("usage") or {}).get("input_tokens", 0), t)
+                settle(prompt_tokens(m.get("usage")), t)
             for b in m.get("content", []):
                 if b["type"] == "thinking":
                     pending.append(["think", "thinking", len(b.get("thinking", "")), None])
