@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Render `claude -p --output-format stream-json` as readable progress lines."""
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -69,4 +70,7 @@ for line in sys.stdin:
         emit(f"{color}■ {ev.get('subtype')} — {ev.get('num_turns')} turns, {secs:.0f}s{RESET}")
     sys.stdout.flush()
 
-report("end")
+# ./agent writes the end report itself once the run is committed and merged (AGENT_RUN is set);
+# runs started some other way get it here.
+if not os.environ.get("AGENT_RUN"):
+    report("end")

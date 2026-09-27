@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 """HTTP proxy to Ollama that keeps slow SSE streams alive.
 
-  keepalive.py PORT HOST:PORT     listen on 127.0.0.1:PORT (0 = pick one; the port is printed first)
+  keepalive.py PORT HOST:PORT [--tag TAG]   listen on 127.0.0.1:PORT (0 = pick one; printed first)
 
 Ollama sends a tool_use block only once the whole call is generated, so a long Write can leave the
 stream silent for minutes and trip Claude Code's 300 s idle watchdog. While the upstream request is
 still open, this inserts Anthropic `ping` events (ignored by the client) between complete events.
 Pings never complete a block or a message, so nothing runs early. They stop after MAX_AGE seconds,
 so a request that is truly stuck still times out.
+
+Every /v1/messages request is also appended to logs/requests/YYYYMMDD.jsonl with TAG (the agent it
+belongs to), its timing and token usage, so reports can attribute Ollama's GPU time per agent.
 """
 import asyncio
+import json
 import os
+import re
 import sys
 import time
+from pathlib import Path
 
 IDLE = 20        # seconds of upstream silence before a ping
 MAX_AGE = 1800   # no pings for requests older than this
 PING = b'event: ping\ndata: {"type": "ping"}\n\n'
+LEDGER = Path(__file__).resolve().parent / "logs" / "requests"
+USAGE = re.compile(rb'"(input_tokens|output_tokens)":\s*(\d+)')
 
 
 def log(msg):
@@ -49,7 +57,16 @@ async def unchunk(reader):
         await reader.readexactly(2)
 
 
-async def relay_sse(up_r, headers, client_w, start):
+def record(entry):
+    try:
+        LEDGER.mkdir(parents=True, exist_ok=True)
+        with open(LEDGER / time.strftime("%Y%m%d.jsonl"), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        log(f"ledger: {e!r}")
+
+
+async def relay_sse(up_r, headers, client_w, start, usage):
     body = unchunk(up_r) if "chunked" in headers.get("transfer-encoding", "") else None
     pending, pings = b"", 0
     nxt = None
@@ -74,6 +91,9 @@ async def relay_sse(up_r, headers, client_w, start):
         pending += data
         cut = pending.rfind(b"\n\n") + 2
         if cut >= 2:
+            if b"message_start" in pending[:cut] or b"message_delta" in pending[:cut]:
+                for k, v in USAGE.findall(pending[:cut]):
+                    usage[k.decode()] = int(v)
             client_w.write(pending[:cut])
             pending = pending[cut:]
             await client_w.drain()
@@ -81,23 +101,30 @@ async def relay_sse(up_r, headers, client_w, start):
     return pings
 
 
-async def handle(client_r, client_w, upstream):
-    up_w = None
+async def handle(client_r, client_w, upstream, tag):
+    up_w, entry = None, None
     try:
         first, lines, headers = await read_head(client_r)
         body = await client_r.readexactly(int(headers.get("content-length", 0)))
         start = time.monotonic()
+        if "/v1/messages" in first and "count_tokens" not in first:
+            entry = {"tag": tag, "t0": round(time.time(), 3), "path": first.split(" ")[1].split("?")[0]}
         up_r, up_w = await asyncio.open_connection(*upstream)
         up_w.write(rewrite(first, lines, {"connection", "keep-alive"}) + body)
         await up_w.drain()
 
         status, lines, headers = await read_head(up_r)
+        if entry:
+            entry["status"], entry["ttfb"] = int(status.split(" ")[1]), round(time.monotonic() - start, 3)
         sse = headers.get("content-type", "").startswith("text/event-stream")
         # SSE is re-sent de-chunked and close-delimited; anything else passes through as is.
         drop = {"connection", "keep-alive"} | ({"transfer-encoding", "content-length"} if sse else set())
         client_w.write(rewrite(status, lines, drop))
         if sse:
-            pings = await relay_sse(up_r, headers, client_w, start)
+            usage = {}
+            pings = await relay_sse(up_r, headers, client_w, start, usage)
+            if entry:
+                entry.update(pings=pings, **usage)
             if pings:
                 log(f"{first} → {status.split(' ', 2)[1]} in {time.monotonic() - start:.0f}s, {pings} pings")
         else:
@@ -106,7 +133,12 @@ async def handle(client_r, client_w, upstream):
         await client_w.drain()
     except (OSError, asyncio.IncompleteReadError, ValueError) as e:
         log(f"error: {e!r}")
+        if entry:
+            entry["error"] = type(e).__name__
     finally:
+        if entry:
+            entry["t1"] = round(time.time(), 3)
+            record(entry)
         for w in (up_w, client_w):
             if w:
                 w.close()
@@ -114,9 +146,10 @@ async def handle(client_r, client_w, upstream):
 
 async def main():
     port, target = int(sys.argv[1]), sys.argv[2]
+    tag = sys.argv[sys.argv.index("--tag") + 1] if "--tag" in sys.argv else "untagged"
     host, tport = target.rsplit(":", 1)
     server = await asyncio.start_server(
-        lambda r, w: handle(r, w, (host, int(tport))), "127.0.0.1", port, limit=1 << 20)
+        lambda r, w: handle(r, w, (host, int(tport)), tag), "127.0.0.1", port, limit=1 << 20)
     print(server.sockets[0].getsockname()[1], flush=True)
     parent = os.getppid()
     async with server:

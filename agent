@@ -4,7 +4,10 @@
 #   ./agent setup                 build the Ollama model variant (run once / after config change)
 #   ./agent new   NAME            create projects/NAME (git repo + CLAUDE.md + TODO.md)
 #   ./agent chat  NAME            interactive Claude Code session in the sandbox
-#   ./agent loop  NAME [ITERS]    autonomous loop: work through TODO.md until done
+#   ./agent loop  NAME [ITERS] [-j N]  work through TODO.md with N agents (default AGENTS)
+#   ./agent worker NAME [ID] [ITERS]   add one agent to NAME's running loop
+#   ./agent status [NAME]         agents, their tasks, and what each open task waits on
+#   ./agent stop  NAME [--now]    stop NAME's agents after their current task (--now: at once)
 #   ./agent run   NAME "PROMPT"   one headless run with a custom prompt
 #   ./agent shell NAME            bash inside the sandbox (to poke around)
 #   ./agent list                  list projects
@@ -16,12 +19,13 @@ source "$ROOT/config.env"
 # Optional secrets passed into the sandbox (GH_TOKEN=...). Not committed.
 [[ -f "$ROOT/secrets.env" ]] && source "$ROOT/secrets.env"
 : "${MAX_STEP_ATTEMPTS:=0}" "${ITER_TIMEOUT:=0}"   # defaults for older config.env files
+: "${AGENTS:=1}" "${NUM_PARALLEL:=1}" "${CTX_MARGIN:=8192}"
 
 SANDBOX_HOME="$ROOT/home"            # becomes /home/agent inside the sandbox
 PROJECTS="$ROOT/projects"
 LOGS="$ROOT/logs"
 RUN="$ROOT/run"
-CLAUDE_BIN="$(readlink -f "$(command -v claude)")"
+CLAUDE_BIN="$(readlink -f "${AGENT_CLAUDE_BIN:-$(command -v claude)}")"   # AGENT_CLAUDE_BIN: tests use a fake
 OLLAMA_PORT="${OLLAMA_URL##*:}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -51,7 +55,8 @@ sandbox() {
   mkdir -p "$RUN" "$LOGS"
   local kafile ka_pid ka_port status=0
   kafile="$(mktemp "$RUN/keepalive.XXXXXX")"
-  python3 "$ROOT/keepalive.py" 0 "127.0.0.1:$OLLAMA_PORT" > "$kafile" 2>>"$LOGS/keepalive.log" &
+  python3 "$ROOT/keepalive.py" 0 "127.0.0.1:$OLLAMA_PORT" --tag "${SB_TAG:-$(basename "$proj")}" \
+    > "$kafile" 2>>"$LOGS/keepalive.log" &
   ka_pid=$!
   for _ in {1..50}; do [[ -s "$kafile" ]] && break; sleep 0.1; done
   ka_port="$(head -1 "$kafile")"; rm -f "$kafile"
@@ -90,14 +95,17 @@ sandbox() {
     --setenv ANTHROPIC_DEFAULT_SONNET_MODEL "$MODEL"
     --setenv ANTHROPIC_DEFAULT_HAIKU_MODEL "$MODEL"
     --setenv CLAUDE_CODE_SUBAGENT_MODEL "$MODEL"
-    --setenv CLAUDE_CODE_MAX_CONTEXT_TOKENS "$NUM_CTX"
-    --setenv CLAUDE_CODE_AUTO_COMPACT_WINDOW "$NUM_CTX"
+    # Ollama's real prompt is ~5k tokens more than the usage Claude Code sees, hence the margin.
+    --setenv CLAUDE_CODE_MAX_CONTEXT_TOKENS "$((NUM_CTX - CTX_MARGIN))"
+    --setenv CLAUDE_CODE_AUTO_COMPACT_WINDOW "$((NUM_CTX - CTX_MARGIN))"
     --setenv CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 1
     --setenv CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK 1   # pings only help streams
     --setenv DISABLE_AUTOUPDATER 1
     --setenv GIT_AUTHOR_NAME agent --setenv GIT_AUTHOR_EMAIL agent@sandbox
     --setenv GIT_COMMITTER_NAME agent --setenv GIT_COMMITTER_EMAIL agent@sandbox
     --setenv NPM_CONFIG_PREFIX /home/agent/.local
+    --setenv AGENT_WORKER "${SB_WORKER:-main}"
+    ${SB_BINDS[@]+"${SB_BINDS[@]}"}
   )
   [[ $tty == 0 ]] && args+=(--new-session)
   # The token goes in through a 0600 file, not --setenv: bwrap's argv is visible to every user in `ps`.
@@ -136,7 +144,18 @@ cmd_setup() {
   ollama list | awk '{print $1}' | grep -qx "$BASE_MODEL" || ollama pull "$BASE_MODEL"
   printf 'FROM %s\nPARAMETER num_ctx %s\n' "$BASE_MODEL" "$NUM_CTX" > "$RUN/Modelfile"
   ollama create "$MODEL" -f "$RUN/Modelfile"
-  echo "ready: $MODEL ($BASE_MODEL, ctx $NUM_CTX)"
+  echo "ready: $MODEL ($BASE_MODEL, ctx $NUM_CTX per request)"
+  # NUM_PARALLEL is a server setting (one KV cache of NUM_CTX per slot), so it lives in systemd.
+  local cur conf=/etc/systemd/system/ollama.service.d/parallel.conf
+  cur="$(systemctl show ollama -p Environment --value 2>/dev/null | grep -oE 'OLLAMA_NUM_PARALLEL=[0-9]+' | cut -d= -f2)"
+  [[ "${cur:-1}" == "$NUM_PARALLEL" ]] && return 0
+  echo "Ollama serves ${cur:-1} request(s) at a time; config.env has NUM_PARALLEL=$NUM_PARALLEL. This needs root:"
+  local cmds="sudo mkdir -p ${conf%/*} && printf '[Service]\\nEnvironment=\"OLLAMA_NUM_PARALLEL=$NUM_PARALLEL\"\\n' | sudo tee $conf >/dev/null && sudo systemctl daemon-reload && sudo systemctl restart ollama"
+  echo "  $cmds"
+  if [[ -t 0 ]]; then
+    read -r -p "Run it now? (restarts Ollama; running agents retry) [y/N] " a
+    [[ "$a" == [yY]* ]] && eval "$cmds" && echo "Ollama restarted with OLLAMA_NUM_PARALLEL=$NUM_PARALLEL"
+  fi
 }
 
 cmd_new() {
@@ -163,23 +182,36 @@ cmd_shell() {
   sandbox "$dir" --tty -- bash
 }
 
-# headless DIR PROMPT LOGFILE — one claude -p run, pretty-printed and logged
+# headless DIR PROMPT LOGFILE RUN_ID — one claude -p run, pretty-printed and logged
 headless() {
-  local dir="$1" prompt="$2" log="$3"
+  local dir="$1" prompt="$2" log="$3" rid="${4:-}"
   sandbox "$dir" -- timeout --kill-after=60 "$ITER_TIMEOUT" claude -p "$prompt" "${claude_args[@]}" \
     --max-turns "$MAX_TURNS" --output-format stream-json --verbose \
-    < /dev/null | tee -a "$log" | python3 "$ROOT/pretty.py"
+    < /dev/null | tee -a "$log" | AGENT_RUN="$rid" python3 "$ROOT/pretty.py"
+}
+
+# Every run is framed by two {"type":"harness"} lines in its log (who ran what, where, and how it
+# ended), which ctxreport.py reads.   run_begin|run_end LOG RUN_ID FIELDS_JSON
+run_begin() {
+  jq -c --arg run "$2" '{type: "harness", event: "start", run: $run, t: now} + .' <<<"$3" >> "$1"
+}
+run_end() {
+  jq -c --arg run "$2" '{type: "harness", event: "end", run: $run, t: now} + .' <<<"$3" >> "$1"
+  # End-of-run report, detached so it never delays the next task.
+  setsid python3 "$ROOT/ctxreport.py" "$1" --run "$2" --trigger end </dev/null >>"$LOGS/ctxreport.log" 2>&1 &
 }
 
 cmd_run() {
   local dir; dir="$(project_dir "${1:-}")"; check_ollama
   [[ -n "${2:-}" ]] || die "usage: ./agent run NAME \"PROMPT\""
   mkdir -p "$LOGS"
-  headless "$dir" "$2" "$LOGS/$1-$(date +%Y%m%d-%H%M%S).jsonl"
-  autocommit "$dir" "agent run"
+  local log="$LOGS/$1-$(date +%Y%m%d-%H%M%S).jsonl" rid="$(date +%s)-run-$RANDOM"
+  run_begin "$log" "$rid" "$(jq -n --arg p "$1" --arg t "$2" --arg d "$dir" --arg b "$(git -C "$dir" rev-parse HEAD)" \
+    '{project: $p, worker: "main", task: $t, workdir: $d, base: $b}')"
+  headless "$dir" "$2" "$log" "$rid" || true
+  autocommit "$dir" "agent run" || true
+  run_end "$log" "$rid" "$(jq -n --arg h "$(git -C "$dir" rev-parse HEAD)" '{head: $h, merged: "n/a"}')"
 }
-
-open_todos() { grep -cE '^\s*- \[ \]' "$1/TODO.md" 2>/dev/null || true; }
 
 autocommit() {
   local dir="$1" msg="$2"
@@ -188,63 +220,180 @@ autocommit() {
   git -C "$dir" -c user.name=agent -c user.email=agent@sandbox commit -qm "$msg"
 }
 
-first_todo() { grep -m1 -E '^\s*- \[ \]' "$1" 2>/dev/null || true; }
+# ── parallel agents ───────────────────────────────────────────────────────────
+# One agent ("main") works in the project directory itself, exactly like the classic loop.
+# With AGENTS > 1, agents w1..wN each get a git worktree in work/NAME/wK on branch agent/wK;
+# sched.py hands out TODO.md tasks (claims + (after: ...) dependencies), and each finished task
+# is merged back into the project's branch under a lock. State lives in run/NAME/.
 
-# A TODO.md line ending in "(checklist: PATH)" is a milestone. While PATH (relative to the project)
-# exists and has an unchecked line, that line is the task; otherwise the milestone line itself is.
-checklist_of() { sed -nE 's/.*\(checklist: ([^) ]+)\).*/\1/p' <<<"$1"; }
+worker_alive() { local f="$RUN/$1/workers/$2.pid"; [[ -f "$f" ]] && kill -0 "$(<"$f")" 2>/dev/null; }
 
-cmd_loop() {
-  local name="${1:-}" dir; dir="$(project_dir "$name")"; check_ollama
-  local iters="${2:-$MAX_ITERS}" stuck=0 attempts=0 task="" prev_task=""
-  mkdir -p "$LOGS"
+live_workers() {   # live_workers [NAME] → "name/id" lines
+  local f n
+  for f in "$RUN"/${1:-*}/workers/*.pid; do
+    [[ -f "$f" ]] && kill -0 "$(<"$f")" 2>/dev/null || continue
+    n="${f#"$RUN"/}"; echo "${n%%/*}/$(basename "$f" .pid)"
+  done
+}
+
+# Git config every worktree of DIR shares: the merge driver for the files all agents edit.
+setup_parallel_repo() {
+  local dir="$1" attrs
+  git -C "$dir" config merge.agentlines.name "agent line merge"
+  git -C "$dir" config merge.agentlines.driver "python3 $ROOT/mergelines.py %O %A %B"
+  attrs="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir)/info/attributes"
+  mkdir -p "$(dirname "$attrs")"
+  local f; for f in TODO.md NOTES.md TASKLOG.md; do
+    grep -qxF "$f merge=agentlines" "$attrs" 2>/dev/null || echo "$f merge=agentlines" >> "$attrs"
+  done
+}
+
+ensure_worktree() {   # DIR WT BRANCH MAIN
+  local dir="$1" wt="$2" br="$3" main="$4"
+  [[ -e "$wt/.git" ]] && return 0
+  git -C "$dir" worktree prune
+  # A leftover branch with work that never reached MAIN is kept under another name, not reset.
+  if git -C "$dir" rev-parse -q --verify "$br" >/dev/null && ! git -C "$dir" merge-base --is-ancestor "$br" "$main"; then
+    git -C "$dir" branch -m "$br" "$br-parked-$(date +%Y%m%d-%H%M%S)"
+  fi
+  mkdir -p "$(dirname "$wt")"
+  git -C "$dir" worktree add -q -B "$br" "$wt" "$main"
+}
+
+# Merge the worktree's branch into MAIN: first MAIN into the branch (inside the worktree, where a
+# conflict can be left for the agent), then fast-forward MAIN. Serialised per project.
+integrate() {   # DIR WT MAIN STATE → 0 merged, 1 conflict
+  local dir="$1" wt="$2" main="$3" st="$4"
+  (
+    flock 9
+    local g=(-c user.name=agent -c user.email=agent@sandbox)
+    if ! git -C "$wt" "${g[@]}" merge -q --no-edit "$main" >/dev/null 2>&1; then
+      git -C "$wt" merge --abort 2>/dev/null || true
+      exit 1
+    fi
+    autocommit "$dir" "edits made in the main checkout" || true
+    git -C "$dir" "${g[@]}" merge -q --no-edit "$(git -C "$wt" rev-parse HEAD)" >/dev/null 2>&1 \
+      || { git -C "$dir" merge --abort 2>/dev/null; exit 1; }
+  ) 9>"$st/merge.lock"
+}
+
+conflict_prompt() {   # MAIN TASK
+  cat <<EOF
+Your branch finished this task, but it cannot be merged into $1 automatically because other agents
+changed the same files in parallel:
+$2
+
+Do only this:
+1. Run \`git merge $1\` and look at \`git status\` / \`git diff\` for the conflicts.
+2. Resolve each conflict so both sides' changes survive. Do not start any new work.
+3. Run the tests. Fix what the merge broke.
+4. Commit the merge.
+EOF
+}
+
+cmd_worker() {
+  local name="${1:-}" wid="${2:-}" iters="${3:-}" dir; dir="$(project_dir "$name")"; check_ollama
+  : "${iters:=$MAX_ITERS}"
+  local st="$RUN/$name"; mkdir -p "$st/workers" "$LOGS"
+  if [[ -z "$wid" ]]; then local k=1; while worker_alive "$name" "w$k"; do k=$((k + 1)); done; wid="w$k"; fi
+  worker_alive "$name" "$wid" && die "agent $wid is already running on $name"
+  if [[ "$wid" == main ]]; then
+    [[ -z "$(live_workers "$name")" ]] || die "parallel agents are running on $name (./agent status $name)"
+  else
+    worker_alive "$name" main && die "a single-agent loop is running on $name"
+  fi
+  [[ -n "$(live_workers "$name")" ]] || rm -f "$st/attempts.json" "$st/failed.json" "$st"/workers/*.json
+  echo $$ > "$st/workers/$wid.pid"
+  export AGENT_PID=$$ MAX_TASK_ATTEMPTS MAX_STEP_ATTEMPTS
+  local n; n="$(live_workers | wc -l)"
+  ((n > NUM_PARALLEL)) && echo "warning: $n agents running but Ollama serves NUM_PARALLEL=$NUM_PARALLEL at a time; requests will queue" >&2
+
+  local wt="$dir" main="" tag="$name" ref=() SB_BINDS=() SB_WORKER="$wid" SB_TAG
   local log="$LOGS/$name-$(date +%Y%m%d-%H%M%S).jsonl"
-  trap 'echo; echo "stopped."; exit 130' INT
-  rm -f "$dir/DONE"
-  for ((i = 1; iters == 0 || i <= iters; i++)); do
-    local todo; todo="$(open_todos "$dir")"
-    if [[ -f "$dir/DONE" || "$todo" == 0 ]]; then
-      echo "✔ all tasks done"; break
+  if [[ "$wid" != main ]]; then
+    main="$(git -C "$dir" symbolic-ref --short HEAD)"
+    wt="$ROOT/work/$name/$wid" tag="$name/$wid" ref=(--ref "$main")
+    log="$LOGS/$name-$wid-$(date +%Y%m%d-%H%M%S).jsonl"
+    setup_parallel_repo "$dir"
+    ensure_worktree "$dir" "$wt" "agent/$wid" "$main"
+    # git inside the sandbox needs the shared .git and the merge driver at their host paths.
+    SB_BINDS+=(--bind "$dir/.git" "$dir/.git" --ro-bind "$ROOT/mergelines.py" "$ROOT/mergelines.py")
+    # Gitignored runtime data every agent shares with the main checkout (venvs, clones, databases).
+    local p; while read -r p; do
+      [[ -z "$p" || "$p" == \#* ]] && continue
+      [[ -e "$dir/$p" ]] || mkdir -p "$dir/$p"
+      SB_BINDS+=(--bind "$dir/$p" "/work/$p")
+    done < <(cat "$dir/.agent-shared" 2>/dev/null)
+  else
+    rm -f "$dir/DONE"
+  fi
+  SB_TAG="$tag"
+  trap 'python3 "$ROOT/sched.py" release "$st" "$wid"; rm -f "$st/workers/$wid.pid"' EXIT
+  trap 'echo; echo "stopped."; exit 130' INT TERM
+
+  local i=0 stuck=0 conflict=0 waited="" job="" task="" prompt rc
+  while ((iters == 0 || i < iters)); do
+    [[ -f "$st/stop" ]] && { echo "■ stop requested"; break; }
+    if [[ "$wid" == main ]]; then
+      [[ -f "$dir/DONE" ]] && { echo "✔ all tasks done"; break; }
+    elif ((conflict == 0)); then
+      autocommit "$wt" "$wid: leftover changes" || true
+      if git -C "$wt" merge-base --is-ancestor HEAD "$main"; then
+        git -C "$wt" reset -q --hard "$main"
+      else
+        conflict=1   # unmerged work from an earlier run (e.g. a crash mid-merge)
+      fi
     fi
-    local src="TODO.md" parent="" cl sub
-    task="$(first_todo "$dir/TODO.md")"
-    cl="$(checklist_of "$task")"
-    if [[ -n "$cl" && -f "$dir/$cl" ]]; then
-      sub="$(first_todo "$dir/$cl")"
-      [[ -n "$sub" ]] && { parent="$task"; task="$sub"; src="$cl"; }
+    if ((conflict)); then
+      prompt="$(conflict_prompt "$main" "${task:-(earlier task)}")"
+    else
+      rc=0; job="$(python3 "$ROOT/sched.py" next "$st" "$wid" "$wt" "${ref[@]}")" || rc=$?
+      case $rc in
+        0) ;;
+        10) echo "✔ all tasks done"; break ;;
+        11) [[ "$waited" == "$job" ]] || echo -e "\033[2m… $wid waiting: $(jq -r '[.claimed[] | "\(.[0]) is on \(.[1][:70])"] | join("; ")' <<<"$job")\033[0m"
+            waited="$job"; sleep 30; continue ;;
+        12) echo "✖ the remaining tasks depend on tasks that were given up:"; jq -r '.failed[]' <<<"$job"; break ;;
+        *) echo "✖ scheduler error ($rc)"; break ;;
+      esac
+      waited=""
+      task="$(jq -r .task <<<"$job")"; prompt="$(jq -r .prompt <<<"$job")"
+      [[ "$(jq -r '.unknown | length' <<<"$job")" == 0 ]] || echo "warning: unknown (after: ...) ids: $(jq -r '.unknown | join(", ")' <<<"$job")" >&2
     fi
-    if [[ "$task" == "$prev_task" ]]; then attempts=$((attempts + 1)); else attempts=1; prev_task="$task"; fi
-    if ((MAX_TASK_ATTEMPTS > 0 && attempts > MAX_TASK_ATTEMPTS)); then
-      echo "✖ gave up after $MAX_TASK_ATTEMPTS attempts on: $task"; break
-    fi
-    # A checklist step that keeps failing: tell the agent to take the checklist's failure path,
-    # and stop the loop if it still doesn't move on.
-    if [[ -n "$parent" ]] && ((MAX_STEP_ATTEMPTS > 0 && attempts > MAX_STEP_ATTEMPTS + 2)); then
-      echo "✖ checklist step still open after the abandon instruction: $task"; break
-    fi
-    local before; before="$(git -C "$dir" rev-parse HEAD)"
-    local of="$iters"; ((iters == 0)) && of="∞"
-    local cap="$MAX_TASK_ATTEMPTS"; ((cap == 0)) && cap="∞"
-    echo -e "\n\033[1m━━ iteration $i/$of — $todo open — attempt $attempts/$cap ━━\033[0m"
-    [[ -n "$parent" ]] && echo -e "\033[2m$src ← ${parent:0:100}\033[0m"
+    i=$((i + 1))
+    local j="${job:-}" of="$iters" fix=""; [[ -n "$j" ]] || j='{}'; ((iters == 0)) && of="∞"; ((conflict)) && fix=" · resolving merge conflict"
+    echo -e "\n\033[1m━━ $name/$wid · iteration $i/$of · $(jq -r '.open // "?"' <<<"$j") open · attempt $(jq -r '.attempts // 1' <<<"$j")$fix ━━\033[0m"
+    [[ -n "$(jq -r '.parent // empty' <<<"$j")" ]] && echo -e "\033[2m$(jq -r '.src + " ← " + .parent[:100]' <<<"$j")\033[0m"
     echo -e "\033[2m$task\033[0m"
-    local prompt; prompt="$(cat "$ROOT/prompts/loop.md")"
-    prompt+=$'\n\n'"## Your task ($src line $(grep -n -m1 -F -- "$task" "$dir/$src" | cut -d: -f1))"$'\n'"$task"
-    if [[ -n "$cl" && -z "$parent" ]]; then
-      prompt+=$'\n\n'"This is a milestone line and $cl does not exist or has no open steps. Do what the line says for that case. Check the milestone only when the line tells you to; after creating a checklist, leave it unchecked."
-    elif [[ -n "$parent" ]]; then
-      prompt+=$'\n\n'"This is one step of the checklist $src, under this TODO.md milestone (leave the milestone unchecked unless the step says to check it):"$'\n'"$parent"$'\n'"Read the Rules and On failure sections at the top of $src first."
+
+    local rid base; rid="$(date +%s)-$wid-$RANDOM"; base="$(git -C "$wt" rev-parse HEAD)"
+    run_begin "$log" "$rid" "$(jq -c --arg p "$name" --arg w "$wid" --arg d "$wt" --arg b "$base" \
+      --arg br "$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null)" --argjson c "$conflict" \
+      --argjson n "$(live_workers "$name" | wc -l)" --argjson np "$NUM_PARALLEL" --argjson ctx "$NUM_CTX" \
+      '{project: $p, worker: $w, workdir: $d, base: $b, branch: $br, agents: $n, num_parallel: $np, num_ctx: $ctx,
+        task: .task, src: .src, parent: .parent, attempts: .attempts, merge_fix: ($c > 0)}' <<<"$j")"
+    headless "$wt" "$prompt" "$log" "$rid" || echo "(run exited non-zero)"
+    autocommit "$wt" "$wid: ${task:0:70}" || true
+    local head merged="n/a"; head="$(git -C "$wt" rev-parse HEAD)"
+    if [[ "$wid" != main ]]; then
+      if [[ "$head" == "$base" ]] && ((conflict == 0)); then
+        merged="nothing"
+      elif integrate "$dir" "$wt" "$main" "$st"; then
+        merged="yes"; conflict=0
+        echo -e "\033[32m⇢ merged into $main\033[0m"
+      elif ((conflict < 2)); then
+        merged="conflict"; conflict=$((conflict + 1))
+        echo -e "\033[33m⚠ merge conflict with $main — next run resolves it\033[0m"
+      else
+        merged="parked"; conflict=0
+        git -C "$wt" branch -f "agent/$wid-parked-$(date +%Y%m%d-%H%M%S)" HEAD
+        git -C "$wt" reset -q --hard "$main"
+        echo -e "\033[31m✖ could not merge; work kept on a parked branch, task goes back to the queue\033[0m"
+      fi
     fi
-    prompt+=$'\n\n'"## Coming next (for context only, do not do these)"$'\n'"$(grep -E '^\s*- \[ \]' "$dir/$src" | sed -n '2,3p')"
-    if ((attempts > 1)); then
-      prompt+=$'\n\n'"This is attempt $attempts at this task; earlier attempts did not finish it. Read NOTES.md for what was tried and why it failed, and try a different approach. Record this attempt's outcome in NOTES.md."
-    fi
-    if [[ -n "$parent" ]] && ((MAX_STEP_ATTEMPTS > 0 && attempts > MAX_STEP_ATTEMPTS)); then
-      prompt+=$'\n\n'"This step has now failed $((attempts - 1)) times. Do not attempt it again: follow the On failure section of $src (use reason STEP_FAILED if no other reason fits), then stop."
-    fi
-    headless "$dir" "$prompt" "$log" || echo "(run exited non-zero)"
-    autocommit "$dir" "loop iteration $i" || true
-    if [[ "$(git -C "$dir" rev-parse HEAD)" == "$before" ]]; then
+    ((conflict)) || python3 "$ROOT/sched.py" release "$st" "$wid"
+    run_end "$log" "$rid" "$(jq -n --arg h "$head" --arg m "$merged" '{head: $h, merged: $m}')"
+    if [[ "$head" == "$base" ]]; then
       stuck=$((stuck + 1))
       echo "no changes this iteration ($stuck/${STUCK_LIMIT/#0/∞})"
       ((STUCK_LIMIT > 0 && stuck >= STUCK_LIMIT)) && { echo "✖ agent seems stuck — stopping"; break; }
@@ -253,7 +402,71 @@ cmd_loop() {
     fi
   done
   echo "log: $log"
-  git -C "$dir" log --oneline -10
+  git -C "$dir" log --oneline -5
+}
+
+cmd_loop() {
+  local name="" iters="" jobs="$AGENTS"
+  while (($#)); do
+    case "$1" in
+      -j) jobs="$2"; shift 2 ;;
+      -j*) jobs="${1#-j}"; shift ;;
+      *) if [[ -z "$name" ]]; then name="$1"; else iters="$1"; fi; shift ;;
+    esac
+  done
+  local dir; dir="$(project_dir "$name")"; check_ollama
+  ((jobs <= 1)) && { cmd_worker "$name" main "$iters"; return; }
+  worker_alive "$name" main && die "a single-agent loop is running on $name"
+  rm -f "$RUN/$name/stop"
+  local ids=() k=1
+  while ((${#ids[@]} < jobs)); do worker_alive "$name" "w$k" || ids+=("w$k"); k=$((k + 1)); done
+  # tmux starts panes with the tmux server's environment, so hand over this shell's overrides.
+  local envs=() v
+  for v in AGENT_CLAUDE_BIN MAX_TURNS STUCK_LIMIT MAX_TASK_ATTEMPTS MAX_STEP_ATTEMPTS ITER_TIMEOUT NET; do
+    envs+=("$v=${!v:-}")
+  done
+  pane() { printf 'bash -c %q' "$(printf '%q ' env "${envs[@]}" "$ROOT/agent" worker "$name" "$1" "$iters"); echo; read -r -p '[agent exited — Enter closes this pane] '"; }
+  local layout=even-vertical; ((jobs > 3)) && layout=tiled
+  if [[ -n "${TMUX:-}" ]]; then
+    local id; for id in "${ids[@]:1}"; do tmux split-window -d -t "$TMUX_PANE" "$(pane "$id")"; done
+    tmux select-layout -t "$TMUX_PANE" "$layout" >/dev/null
+    cmd_worker "$name" "${ids[0]}" "$iters"
+  else
+    local s="agent-$name"
+    tmux new-session -d -s "$s" -x 240 -y 70 "$(pane "${ids[0]}")"
+    local id; for id in "${ids[@]:1}"; do tmux split-window -d -t "$s" "$(pane "$id")"; done
+    tmux select-layout -t "$s" "$layout" >/dev/null
+    if [[ -t 1 ]]; then exec tmux attach -t "$s"; else echo "agents running in tmux session $s"; fi
+  fi
+}
+
+cmd_status() {
+  local name dir main
+  for name in ${1:-$(ls "$RUN" 2>/dev/null)}; do
+    dir="$PROJECTS/$name"; [[ -d "$dir/.git" && -d "$RUN/$name/workers" ]] || continue
+    echo -e "\033[1m$name\033[0m"
+    if worker_alive "$name" main || [[ -z "$(live_workers "$name")" ]]; then
+      python3 "$ROOT/sched.py" status "$RUN/$name" "$dir"
+    else
+      main="$(git -C "$dir" symbolic-ref --short HEAD)"
+      python3 "$ROOT/sched.py" status "$RUN/$name" "$dir" --ref "$main"
+    fi
+    echo
+  done
+}
+
+cmd_stop() {
+  local name="${1:-}"; project_dir "$name" >/dev/null
+  mkdir -p "$RUN/$name"; touch "$RUN/$name/stop"
+  if [[ "${2:-}" == --now ]]; then
+    local w pid; for w in $(live_workers "$name"); do
+      pid="$(<"$RUN/${w%%/*}/workers/${w#*/}.pid")"
+      kill -TERM -- "-$(ps -o pgid= -p "$pid" | tr -d ' ')" 2>/dev/null || kill -TERM "$pid"
+    done
+    echo "stopped $name's agents"
+  else
+    echo "$name's agents stop after their current task (./agent status $name)"
+  fi
 }
 
 cmd_list() { ls -1 "$PROJECTS" 2>/dev/null; }
@@ -265,8 +478,11 @@ case "$sub" in
   new)   cmd_new "$@" ;;
   chat)  cmd_chat "$@" ;;
   loop)  cmd_loop "$@" ;;
+  worker) cmd_worker "$@" ;;
+  status) cmd_status "$@" ;;
+  stop)  cmd_stop "$@" ;;
   run)   cmd_run "$@" ;;
   shell) cmd_shell "$@" ;;
   list)  cmd_list ;;
-  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

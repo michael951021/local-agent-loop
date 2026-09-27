@@ -11,3 +11,6 @@ secrets.env
 __pycache__/
 reports/
 *.new
+work/
+ffprof/
+shot.png

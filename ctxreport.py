@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Context + GPU report for one agent run, as a self-contained HTML page.
 
-  ctxreport.py LOG.jsonl [--session SID] [--trigger end|compact|manual]
+  ctxreport.py LOG.jsonl [--run RID | --session SID | --all] [--trigger end|compact|manual]
   ctxreport.py --session SID [--trigger ...]        find the log that holds SID
-  ctxreport.py --index                              only rebuild reports/index.html
+  ctxreport.py --index                              only rebuild reports/index.html and fleet.html
 
-Writes reports/<project>/<start>-<sid8>-<trigger>.html and refreshes reports/index.html.
-Run automatically by pretty.py at the end of every run and on every compaction.
+Writes reports/<project>/<start>-[<agent>-]<sid8>-<trigger>.html, then refreshes reports/index.html
+and reports/fleet.html. ./agent runs it at the end of every run (--run); pretty.py on each compaction.
+Data comes from telemetry.py, the page look from reportui.py.
 
 Context attribution: each API call reports the real prompt size (usage.input_tokens). The growth
 between two calls is split across what was added in between (tool results, tool inputs, thinking,
@@ -23,8 +24,11 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-LOGS, REPORTS = ROOT / "logs", ROOT / "reports"
+import reportui
+from telemetry import (LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
+                       guess_task, harness_runs, ledger, log_runs, ollama_requests, read_session)
+
+REPORTS = ROOT / "reports"
 
 # Fixed category order = fixed colour slot (a category keeps its colour in every report).
 CATS = [
@@ -46,15 +50,6 @@ def tool_cat(name):
     return TOOL_CAT.get(name) or ("search" if name.startswith("mcp__websearch") else "other")
 
 
-def ts(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() if s else None
-
-
-def num_ctx():
-    m = re.search(r"^NUM_CTX=(\d+)", (ROOT / "config.env").read_text(), re.M)
-    return int(m.group(1)) if m else 131072
-
-
 def short(s, n=70):
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[: n - 1] + "…"
@@ -66,30 +61,10 @@ def text_of(content):
     return "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content or [])
 
 
-# ── stream log ────────────────────────────────────────────────────────────────
+# ── context attribution ──────────────────────────────────────────────────────
 
-def read_session(log, sid):
-    events = []
-    for line in open(log, errors="replace"):
-        if sid not in line or line.startswith('{"type":"system","subtype":"thinking_tokens"'):
-            continue
-        try:
-            d = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if d.get("session_id") == sid:
-            events.append(d)
-    return events
-
-
-def sessions_in(log):
-    seen = []
-    for line in open(log, errors="replace"):
-        if '"subtype":"init"' in line:
-            sid = json.loads(line).get("session_id")
-            if sid and sid not in seen:
-                seen.append(sid)
-    return seen
+def ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() if s else None
 
 
 def analyse(events):
@@ -193,133 +168,95 @@ def analyse(events):
             "retries": retries, "result": result, "t0": t_first, "t1": t_last}
 
 
-# ── Ollama journal ────────────────────────────────────────────────────────────
-
-RX = {
-    "start": re.compile(r"task (\d+) \| new prompt, .*task\.n_tokens = (\d+)"),
-    "full": re.compile(r"task (\d+) \| forcing full prompt re-processing"),
-    "prefill": re.compile(r"task (\d+) \| prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens"),
-    "gen": re.compile(r"task (\d+) \|\s+eval time =\s*([\d.]+) ms /\s*(\d+) tokens"),
-    "progress": re.compile(r"task (\d+) \| n_gen =\s*(\d+), tg =\s*([\d.]+)"),
-    "pp": re.compile(r"task (\d+) \| prompt processing, n_tokens =\s*(\d+), progress = [\d.]+, t =\s*([\d.]+) s"),
-    "end": re.compile(r"task (\d+) \| stop processing: n_tokens = (\d+)"),
-    "cancel": re.compile(r"cancel task, id_task = (\d+)"),
-}
-
-
-def ollama_requests(t0, t1):
-    try:
-        out = subprocess.run(["journalctl", "-u", "ollama", "--no-pager", "-o", "short-unix",
-                              "--since", f"@{int(t0) - 30}", "--until", f"@{int(t1) + 30}"],
-                             capture_output=True, text=True, timeout=120).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    reqs = {}
-    for line in out.splitlines():
-        if "task" not in line:
-            continue
-        try:
-            t = float(line.split(" ", 1)[0])
-        except ValueError:
-            continue
-        for key, rx in RX.items():
-            m = rx.search(line)
-            if not m:
-                continue
-            tid = m.group(1)
-            if key == "start":
-                reqs[tid] = {"t": t, "prompt": int(m.group(2)), "processed": None, "prefill_s": None,
-                             "gen": 0, "gen_s": 0.0, "tps": None, "full": False, "cancelled": False, "end": None}
-                continue
-            r = reqs.get(tid)
-            if not r:
-                break
-            if key == "full":
-                r["full"] = True
-            elif key == "prefill":
-                r["prefill_s"], r["processed"] = float(m.group(2)) / 1000, int(m.group(3))
-            elif key == "gen":
-                r["gen_s"], r["gen"] = float(m.group(2)) / 1000, int(m.group(3))
-                r["tps"] = r["gen"] / r["gen_s"] if r["gen_s"] else None
-            elif key == "progress":
-                r["gen"], r["tps"] = int(m.group(2)), float(m.group(3))
-            elif key == "pp":
-                r["pp_last"] = (t, float(m.group(3)))
-            elif key == "end":
-                r["end"] = t
-            elif key == "cancel":
-                r["cancelled"] = True
-            break
-    res = []
-    for r in reqs.values():
-        if not (t0 - 5 <= r["t"] <= t1 + 5):
-            continue
-        end = r["end"] or r["t"]
-        if r["prefill_s"] is None:   # cancelled before the summary line: estimate from progress lines
-            r["prefill_s"] = r.get("pp_last", (0, 0.0))[1]
-            r["gen_s"] = max(0.0, end - r["t"] - r["prefill_s"])
-        r["processed"] = r["processed"] if r["processed"] is not None else r["prompt"]
-        r["reused"] = max(0, r["prompt"] - r["processed"])
-        r["wall_s"] = round(end - r["t"], 1)
-        r.pop("pp_last", None)
-        res.append(r)
-    return sorted(res, key=lambda r: r["t"])
-
-
-# ── GPU samples ───────────────────────────────────────────────────────────────
-
-def gpu_samples(t0, t1):
-    rows = defaultdict(dict)
-    days = {time.strftime("%Y%m%d", time.localtime(x)) for x in (t0, t1)}
-    for day in sorted(days):
-        f = LOGS / "gpu" / f"{day}.csv"
-        if not f.exists():
-            continue
-        for line in f.read_text().splitlines():
-            p = line.split(",")
-            try:
-                t = int(p[0])
-                if t0 - 5 <= t <= t1 + 5:
-                    rows[t][int(p[1])] = [float(p[2]), float(p[3]) / 1024, float(p[4]) / 1024, float(p[5]), float(p[6])]
-            except (ValueError, IndexError):
-                continue
-    return [{"t": t, "g": g} for t, g in sorted(rows.items())]
-
-
-# ── project info ──────────────────────────────────────────────────────────────
-
-def project_info(project, t0, t1):
-    pdir = ROOT / "projects" / project
-    if not (pdir / ".git").exists():
-        return None, []
-    git = lambda *a: subprocess.run(["git", "-C", str(pdir), *a], capture_output=True, text=True).stdout
-    commits = git("log", f"--since=@{int(t0)}", f"--until=@{int(t1) + 120}", "--format=%h %s").splitlines()
-    task = None
-    diff = git("log", "-p", f"--since=@{int(t0)}", f"--until=@{int(t1) + 120}", "--format=", "--", "*.md")
-    m = re.search(r"^\+\s*- \[x\] (.+)$", diff, re.M)
-    if m:
-        task = m.group(1)
-    elif (pdir / "TODO.md").exists():
-        m = re.search(r"^\s*- \[ \] (.+)$", (pdir / "TODO.md").read_text(), re.M)
-        task = m.group(1) if m else None
-    return task, commits
-
-
 # ── report ────────────────────────────────────────────────────────────────────
 
-def build(log, sid, trigger):
+def report_links():
+    """{run id: 'project/file.html'} for every end report, so timelines can link to other runs."""
+    links = {}
+    for f in REPORTS.glob("*/*.json"):
+        try:
+            s = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if s.get("run") and (s.get("trigger") == "end" or s["run"] not in links):
+            links[s["run"]] = f"{f.parent.name}/{f.stem}.html"
+    return links
+
+
+def lane_order(tag, mine):
+    return (tag != mine, tag == "other clients", tag)
+
+
+def timeline(all_reqs, runs, t0, t1, mine, prefix="../"):
+    """Per-agent lanes of runs and requests, in minutes from t0."""
+    links = report_links()
+    by = defaultdict(lambda: {"runs": [], "reqs": []})
+    span = (t1 - t0) / 60
+    for r in all_reqs:
+        a, b = (max(r["t"], t0) - t0) / 60, (min(r["end"], t1) - t0) / 60
+        if b <= 0 or a >= span:
+            continue
+        by[r["tag"]]["reqs"].append({
+            "a": round(a, 3), "b": round(max(b, a + 0.01), 3), "p": round(r["prefill_s"] / 60, 3),
+            "t": f"<b>{html.escape(r['tag'])}</b> · slot {r['slot']}<div class='note'>{r['prompt'] / 1000:.1f}k prompt · "
+                 f"{r['prefill_s']:.0f}s reading · {r['gen']} tokens in {r['gen_s']:.0f}s"
+                 f"{' · cancelled' if r['cancelled'] else ''}</div>"})
+    for run in runs:
+        st, en = run["start"], run["end"]
+        b = en["t"] if en else t1
+        if b < t0 or st["t"] > t1:
+            continue
+        href = links.get(st["run"])
+        by[agent_tag(st)]["runs"].append({
+            "a": round((max(st["t"], t0) - t0) / 60, 3), "b": round((min(b, t1) - t0) / 60, 3),
+            "href": prefix + href if href else None,
+            "t": f"<b>{html.escape(agent_tag(st))}</b> · {html.escape(clean_task(st.get('task'))[:140] or 'run')}"
+                 f"<div class='note'>{(b - st['t']) / 60:.0f} min{' · ' + en['merged'] if en and en.get('merged') not in (None, 'n/a') else ''}"
+                 f"{' · click for its report' if href else ''}</div>"})
+    return [{"tag": t, **v} for t, v in sorted(by.items(), key=lambda kv: lane_order(kv[0], mine))]
+
+
+def build(log, sid, trigger, run=None):
     log = Path(log)
-    project = re.sub(r"-\d{8}-\d{6}\.jsonl$", "", log.name)
+    start, end = (run or {}).get("start"), (run or {}).get("end")
+    project = start["project"] if start else re.sub(r"(-w\d+)?-\d{8}-\d{6}\.jsonl$", "", log.name)
+    worker = (start or {}).get("worker") or "main"
+    tag = agent_tag(start) or project
     a = analyse(read_session(log, sid))
     if not a["calls"]:
         sys.exit(f"no API calls for session {sid} in {log}")
     res = a["result"] or {}
     t0 = a["t0"]
-    t1 = max(a["t1"], t0 + (res.get("duration_ms") or 0) / 1000) if res else time.time()
-    reqs = ollama_requests(t0, t1)
+    t1 = end["t"] if end else (max(a["t1"], t0 + (res.get("duration_ms") or 0) / 1000) if res else time.time())
+
+    # Model requests: with the keepalive ledger each one is attributed to its agent; without it
+    # (runs from before the ledger existed) every request in the time window counts as this run's.
+    all_reqs = attribute(ollama_requests(t0, t1), ledger(t0, t1))
+    for r in all_reqs:
+        if r["tag"] == "untagged":   # proxy started by an older ./agent: single agent, so it is us
+            r["tag"] = tag
+    tags = {r["tag"] for r in all_reqs}
+    reqs = [r for r in all_reqs if r["tag"] == tag] if tags - {"other clients"} else all_reqs
+    share = None
+    if len(tags) > 1:
+        sec, busy, overlap = fair_share(all_reqs, t0, t1)
+        runs = [r for r in harness_runs(t0 - 86400) if (r["end"] or {}).get("t", t1) >= t0 and r["start"]["t"] <= t1]
+        share = {"mine_pct": round(100 * sec.get(tag, 0) / busy, 1) if busy else 0,
+                 "agents": len(tags - {"other clients"}) or 1,
+                 "overlap_pct": round(100 * overlap / busy, 1) if busy else 0,
+                 "rows": [{"tag": t, "n": sum(r["tag"] == t for r in all_reqs), "s": round(v),
+                           "pct": round(100 * v / busy, 1) if busy else 0}
+                          for t, v in sorted(sec.items(), key=lambda kv: lane_order(kv[0], tag))],
+                 "lanes": timeline(all_reqs, runs, t0, t1, tag)}
+
     gpu = gpu_samples(t0, t1)
-    task, commits = project_info(project, t0, t1)
-    window = num_ctx()
+    if start and start.get("task"):
+        task = ("Merge fix: " if start.get("merge_fix") else "") + clean_task(start["task"])
+        cs = commits(project, start.get("base"), (end or {}).get("head"))
+    else:
+        task, cs = guess_task(project, t0, t1)
+    # The window each request really had (Ollama logs it), else what the harness was configured with.
+    window = max((r["n_ctx"] for r in reqs), default=None) or (start or {}).get("num_ctx") or config("NUM_CTX", 131072)
     peak = max(c["total"] for c in a["calls"])
     last = a["calls"][-1]["comp"]
     # Share of context growth by category, over the whole run (compactions included).
@@ -348,16 +285,17 @@ def build(log, sid, trigger):
     power = [sum(v[3] for v in s["g"].values()) for s in gpu]
     energy_wh = sum(power) * 5 / 3600 if power else 0
 
-    start = datetime.fromtimestamp(t0)
+    begun = datetime.fromtimestamp(t0)
     data = {
         "title": task or f"session {sid[:8]}",
-        "project": project, "sid": sid, "trigger": trigger, "log": log.name,
-        "start": start.strftime("%Y-%m-%d %H:%M"), "window": window,
+        "project": project, "worker": worker, "tag": tag, "sid": sid, "trigger": trigger, "log": log.name,
+        "branch": (start or {}).get("branch"), "merged": (end or {}).get("merged"),
+        "start": begun.strftime("%Y-%m-%d %H:%M"), "window": window,
         "cats": [{"key": k, "name": n} for k, n in CATS],
         "calls": [{"turn": c["turn"], "min": round((c["t"] - t0) / 60, 2) if c["t"] else None, "total": c["total"],
                    "delta": c["delta"], "comp": c["comp"], "added": c["added"]} for c in a["calls"]],
         "final": last, "growth": growth, "top": a["top"], "tools": a["tools"],
-        "compactions": a["compactions"], "commits": commits,
+        "compactions": a["compactions"], "commits": cs, "share": share,
         "reqs": [{"min": round((r["t"] - t0) / 60, 2), **{k: r[k] for k in
                   ("prompt", "reused", "processed", "prefill_s", "gen", "gen_s", "tps", "full", "cancelled", "wall_s")}}
                  for r in reqs],
@@ -371,6 +309,7 @@ def build(log, sid, trigger):
             "wall_min": round(wall / 60, 1), "turns": len(a["calls"]),
             "outcome": ("error" if res.get("is_error") else res.get("subtype")) if res else "running / killed",
             "peak": peak, "peak_pct": round(100 * peak / window, 1), "end_ctx": a["calls"][-1]["total"],
+            "real_peak": max((r["prompt"] for r in reqs), default=None),
             "think_pct": round(100 * growth.get("think", 0) / max(1, sum(growth.values())), 1),
             "retries": a["retries"], "compactions": len(a["compactions"]),
             "prefill_s": round(pre_s), "gen_s": round(gen_s), "other_s": round(max(0, wall - pre_s - gen_s)),
@@ -385,12 +324,12 @@ def build(log, sid, trigger):
     }
     out_dir = REPORTS / project
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = f"{start.strftime('%Y%m%d-%H%M')}-{sid[:8]}-{trigger}"
-    page = TEMPLATE.replace("__TITLE__", html.escape(data["title"][:80])).replace(
-        "__DATA__", json.dumps(data, separators=(",", ":")).replace("</", "<\\/"))
-    (out_dir / f"{name}.html").write_text(page)
-    summary = {k: data[k] for k in ("title", "project", "start", "trigger")} | {
-        k: data["stats"][k] for k in ("wall_min", "turns", "peak_pct", "think_pct", "gen_tps", "util_avg", "outcome", "compactions", "retries")}
+    name = f"{begun.strftime('%Y%m%d-%H%M')}-{'' if worker == 'main' else worker + '-'}{sid[:8]}-{trigger}"
+    (out_dir / f"{name}.html").write_text(reportui.page(data["title"][:80], data, TEMPLATE_JS))
+    summary = {k: data[k] for k in ("title", "project", "worker", "tag", "start", "trigger", "merged")} | {
+        "run": (start or {}).get("run"), "share_pct": share and share["mine_pct"]} | {
+        k: data["stats"][k] for k in ("wall_min", "turns", "peak_pct", "think_pct", "gen_tps", "util_avg", "outcome",
+                                      "compactions", "retries")}
     (out_dir / f"{name}.json").write_text(json.dumps(summary))
     build_index()
     return out_dir / f"{name}.html"
@@ -398,18 +337,26 @@ def build(log, sid, trigger):
 
 def build_index():
     rows = []
-    for f in sorted(REPORTS.glob("*/*.json"), reverse=True):
+    for f in sorted(REPORTS.glob("*/*.json"), key=lambda p: p.name[:13], reverse=True):
         s = json.loads(f.read_text())
+        who = s.get("tag") or s["project"]
+        merged = {"conflict": " · merge conflict", "parked": " · parked"}.get(s.get("merged"), "")
         rows.append(
-            f'<tr><td class="num">{s["start"]}</td><td>{html.escape(s["project"])}</td>'
+            f'<tr><td class="num">{s["start"]}</td><td>{html.escape(who)}</td>'
             f'<td><a href="{f.parent.name}/{f.stem}.html">{html.escape(short(s["title"], 90))}</a></td>'
             f'<td>{s["trigger"]}</td><td class="num">{s["wall_min"]}</td><td class="num">{s["turns"]}</td>'
             f'<td class="num">{s["peak_pct"]}%</td><td class="num">{s["think_pct"]}%</td>'
-            f'<td class="num">{s["gen_tps"] and round(s["gen_tps"], 1)}</td><td class="num">{s["util_avg"]}</td>'
-            f'<td>{html.escape(str(s["outcome"]))}{" · " + str(s["compactions"]) + " compact" if s["compactions"] else ""}'
+            f'<td class="num">{s["gen_tps"] and round(s["gen_tps"], 1)}</td>'
+            f'<td class="num">{s["share_pct"] if s.get("share_pct") is not None else "–"}</td>'
+            f'<td>{html.escape(str(s["outcome"]))}{merged}{" · " + str(s["compactions"]) + " compact" if s["compactions"] else ""}'
             f'{" · " + str(s["retries"]) + " retries" if s["retries"] else ""}</td></tr>')
     REPORTS.mkdir(exist_ok=True)
     (REPORTS / "index.html").write_text(INDEX.replace("__ROWS__", "\n".join(rows)))
+    try:
+        import fleet
+        fleet.build()
+    except Exception as e:   # the fleet page must never cost us the run report
+        print(f"fleet page: {e!r}", file=sys.stderr)
 
 
 def find_log(sid):
@@ -422,6 +369,7 @@ def find_log(sid):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("log", nargs="?")
+    ap.add_argument("--run", help="harness run id (from ./agent)")
     ap.add_argument("--session")
     ap.add_argument("--trigger", default="manual")
     ap.add_argument("--all", action="store_true", help="one report per session in LOG")
@@ -432,110 +380,44 @@ def main():
     log = args.log or (find_log(args.session) if args.session else None)
     if not log:
         ap.error("give LOG or --session")
-    sids = sessions_in(log) if args.all else [args.session or sessions_in(log)[-1]]
-    for sid in sids:
-        print(build(log, sid, args.trigger))
+    runs = [r for r in log_runs(log) if r["sessions"]]
+    if args.run:
+        runs = [r for r in runs if r["start"] and r["start"]["run"] == args.run]
+    elif args.session:
+        runs = [r for r in runs if args.session in r["sessions"]]
+    elif not args.all:
+        runs = runs[-1:]
+    if not runs:
+        sys.exit(f"nothing to report in {log}")
+    for r in runs:
+        print(build(log, args.session or r["sessions"][0], args.trigger, r))
 
 
-CSS = """
-:root{color-scheme:light;--bg:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
---grid:#e1e0d9;--axis:#c3c2b7;--ring:rgba(11,11,11,.10);--crit:#d03b3b;--warn:#b27a00;
---c1:#2a78d6;--c2:#eb6834;--c3:#1baf7a;--c4:#eda100;--c5:#e87ba4;--c6:#008300;--c7:#4a3aa7;--c8:#e34948}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#0d0d0d;--surface:#1a1a19;
---ink:#fff;--ink2:#c3c2b7;--grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.10);--warn:#fab219;
---c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500;--c5:#d55181;--c6:#008300;--c7:#9085e9;--c8:#e66767}}
-:root[data-theme="dark"]{color-scheme:dark;--bg:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink2:#c3c2b7;--grid:#2c2c2a;
---axis:#383835;--ring:rgba(255,255,255,.10);--warn:#fab219;--c1:#3987e5;--c2:#d95926;--c3:#199e70;--c4:#c98500;
---c5:#d55181;--c6:#008300;--c7:#9085e9;--c8:#e66767}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:1180px;margin:0 auto;padding:24px 16px 48px}
-h1{font-size:19px;margin:0 0 4px;font-weight:600}h2{font-size:14px;margin:0 0 2px;font-weight:600}
-.sub{color:var(--ink2);font-size:12.5px}.note{color:var(--muted);font-size:12px;margin:2px 0 10px}
-.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:10px;margin:18px 0}
-.tile{background:var(--surface);border:1px solid var(--ring);border-radius:10px;padding:10px 12px}
-.tile .k{color:var(--ink2);font-size:12px}.tile .v{font-size:22px;font-weight:600;margin-top:2px}
-.tile .s{color:var(--muted);font-size:11.5px}.bad{color:var(--crit)}.warn{color:var(--warn)}
-.card{background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:14px 16px;margin:12px 0}
-.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}.grid2 .card{margin:0}
-.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}.grid3 .card{margin:0}
-svg{display:block;width:100%;overflow:visible}svg text{fill:var(--muted);font-size:11px}
-.legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin:6px 0 2px;font-size:12px;color:var(--ink2)}
-.sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
-.bar100{display:flex;gap:2px;height:22px;margin:8px 0}.bar100 div{border-radius:4px;min-width:2px}
-table{border-collapse:collapse;width:100%;font-size:12.5px}td,th{padding:4px 8px;text-align:left;border-bottom:1px solid var(--grid)}
-th{color:var(--ink2);font-weight:500}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.hb{display:grid;grid-template-columns:minmax(0,1fr) 150px 52px;gap:8px;align-items:center;font-size:12.5px;padding:3px 0}
-.hb .l{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}.hb .b{height:12px;border-radius:0 4px 4px 0}
-details{margin-top:8px}summary{cursor:pointer;color:var(--ink2);font-size:12.5px}
-.scroll{max-height:360px;overflow:auto}.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
-#tip{position:fixed;pointer-events:none;background:var(--surface);color:var(--ink);border:1px solid var(--ring);
-border-radius:8px;padding:7px 9px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.15);display:none;z-index:9;max-width:340px}
-#tip .r{display:flex;justify-content:space-between;gap:14px}#tip b{font-weight:600}
-a{color:var(--c1)}ul.commits{margin:4px 0 0;padding-left:18px}
-"""
+INDEX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent run reports</title>
+<style>""" + reportui.CSS + """</style></head><body><main><h1>Agent run reports</h1>
+<div class="sub">One row per report — written at the end of each run and at every compaction. Newest first.
+ · <a href="fleet.html"><b>Fleet view</b></a>: every agent on one timeline, and how they share the GPUs</div>
+<section class="card" style="overflow-x:auto"><table><tr><th>Start</th><th>Agent</th><th>Task</th><th>Trigger</th>
+<th class="num">Min</th><th class="num">Turns</th><th class="num">Peak ctx</th><th class="num">Thinking</th>
+<th class="num">Gen t/s</th><th class="num">GPU share %</th><th>Outcome</th></tr>
+__ROWS__</table></section></main></body></html>"""
 
-TEMPLATE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>__TITLE__</title>
-<style>""" + CSS + """</style></head><body><main id="app"></main><div id="tip"></div>
-<script id="data" type="application/json">__DATA__</script>
-<script>
-const D=JSON.parse(document.getElementById('data').textContent),S=D.stats,app=document.getElementById('app'),tip=document.getElementById('tip');
-const col=i=>`var(--c${i+1})`,catIdx=Object.fromEntries(D.cats.map((c,i)=>[c.key,i])),catCol=k=>col(catIdx[k]);
-const k=v=>v==null?'–':Math.abs(v)>=1000?(v/1000).toFixed(Math.abs(v)>=1e5?0:1)+'k':String(Math.round(v));
-const f1=v=>v==null?'–':(+v).toFixed(1),esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const mins=m=>m==null?'–':m<60?m.toFixed(1)+' min':Math.floor(m/60)+'h '+Math.round(m%60)+'m';
-function showTip(e,h){tip.innerHTML=h;tip.style.display='block';const w=tip.offsetWidth,x=e.clientX+14;
- tip.style.left=(x+w>innerWidth?e.clientX-w-14:x)+'px';tip.style.top=Math.min(e.clientY+12,innerHeight-tip.offsetHeight-8)+'px'}
-function hideTip(){tip.style.display='none'}
-const NS='http://www.w3.org/2000/svg';
-function el(t,a,p){const n=document.createElementNS(NS,t);for(const x in a)n.setAttribute(x,a[x]);if(p)p.appendChild(n);return n}
-function ticks(max,n=4){if(max<=0)return[0];const raw=max/n,m=Math.pow(10,Math.floor(Math.log10(raw))),s=[1,2,2.5,5,10].map(x=>x*m).find(x=>x>=raw);
- const r=[];for(let v=0;v<=max*1.0001;v+=s)r.push(+v.toFixed(6));return r}
-function legend(items){return '<div class="legend">'+items.map(i=>`<span><span class="sw" style="background:${i.c}"></span>${esc(i.n)}</span>`).join('')+'</div>'}
-function card(h,note,body,cls='card'){return `<section class="${cls}"><h2>${h}</h2>${note?`<div class="note">${note}</div>`:''}${body}</section>`}
 
-// Generic chart: x values, series [{n,c,v:[]}], stacked or lines, with crosshair tooltip.
-function chart(host,{x,series,stacked=false,H=200,yfmt=k,xfmt=v=>v,xlabel='',limit=null,marks=[],bars=false,tipx=null,ymax=null}){
- const draw=()=>{host.innerHTML='';const W=host.clientWidth||600,L=44,R=8,T=10,B=26,pw=W-L-R,ph=H-T-B;
-  const svg=el('svg',{viewBox:`0 0 ${W} ${H}`,height:H},host),n=x.length;if(!n){host.innerHTML='<div class="note">no data</div>';return}
-  const cum=series.map(()=>new Array(n).fill(0));series.forEach((s,j)=>s.v.forEach((v,i)=>{cum[j][i]=(stacked&&j?cum[j-1][i]:0)+(v||0)}));
-  let top=ymax??Math.max(1,...(stacked?cum[cum.length-1]:series.flatMap(s=>s.v.filter(v=>v!=null))));if(limit)top=Math.max(top,limit);top*=1.04;
-  const x0=Math.min(...x),x1=Math.max(...x),bw=bars?Math.max(2,pw/n-2):0;
-  const X=i=>bars?L+(i+.5)*pw/n:L+(x1>x0?(x[i]-x0)/(x1-x0):.5)*pw,Y=v=>T+ph-(v/top)*ph;
-  for(const t of ticks(top/1.04)){el('line',{x1:L,x2:W-R,y1:Y(t),y2:Y(t),stroke:'var(--grid)'},svg);el('text',{x:L-6,y:Y(t)+4,'text-anchor':'end'},svg).textContent=yfmt(t)}
-  el('line',{x1:L,x2:W-R,y1:T+ph,y2:T+ph,stroke:'var(--axis)'},svg);
-  const xt=bars?ticks(n-1,6).filter(v=>Number.isInteger(v)&&v<n):ticks(x1-x0,6).map(v=>v+x0).filter(v=>v<=x1);
-  for(const t of xt){const px=bars?X(t):L+(x1>x0?(t-x0)/(x1-x0):.5)*pw;if(xlabel&&px>W-R-40)continue;el('text',{x:px,y:H-8,'text-anchor':'middle'},svg).textContent=xfmt(bars?x[t]:t)}
-  if(xlabel)el('text',{x:W-R,y:H-8,'text-anchor':'end'},svg).textContent=xlabel;
-  if(bars){series.forEach((s,j)=>s.v.forEach((v,i)=>{if(!v)return;const y0=stacked&&j?cum[j-1][i]:0,h=Math.max(0,Y(y0)-Y(y0+v)-(j?2:0));
-    el('rect',{x:X(i)-bw/2,y:Y(y0+v),width:bw,height:h,rx:Math.min(2,bw/2),fill:s.c},svg)}))}
-  else if(stacked){for(let j=series.length-1;j>=0;j--){let d='';for(let i=0;i<n;i++)d+=(i?'L':'M')+X(i)+','+Y(cum[j][i]);for(let i=n-1;i>=0;i--)d+='L'+X(i)+','+Y(j?cum[j-1][i]:0);
-    el('path',{d:d+'Z',fill:series[j].c,stroke:'var(--surface)','stroke-width':1,'stroke-linejoin':'round'},svg)}}
-  else series.forEach(s=>{let d='',pen=false;s.v.forEach((v,i)=>{if(v==null){pen=false;return}d+=(pen?'L':'M')+X(i)+','+Y(v);pen=true});
-    el('path',{d,fill:'none',stroke:s.c,'stroke-width':2,'stroke-linejoin':'round'},svg)});
-  if(limit){el('line',{x1:L,x2:W-R,y1:Y(limit),y2:Y(limit),stroke:'var(--crit)','stroke-dasharray':'4 3'},svg);
-    el('text',{x:W-R,y:Y(limit)-5,'text-anchor':'end',style:'fill:var(--crit)'},svg).textContent='window '+k(limit)}
-  for(const m of marks){const px=X(m.i);el('line',{x1:px,x2:px,y1:T,y2:T+ph,stroke:'var(--ink2)'},svg);el('text',{x:px+4,y:T+10,style:'fill:var(--ink2)'},svg).textContent=m.label}
-  const cross=el('line',{y1:T,y2:T+ph,stroke:'var(--ink2)','stroke-width':1,visibility:'hidden'},svg);
-  const hit=el('rect',{x:L,y:T,width:pw,height:ph,fill:'transparent'},svg);
-  hit.addEventListener('mousemove',e=>{const r=svg.getBoundingClientRect(),mx=(e.clientX-r.left)*W/r.width;let bi=0,bd=1e9;
-   for(let i=0;i<n;i++){const d=Math.abs(X(i)-mx);if(d<bd){bd=d;bi=i}}cross.setAttribute('x1',X(bi));cross.setAttribute('x2',X(bi));cross.setAttribute('visibility','visible');
-   const rows=[...series].reverse().filter(s=>s.v[bi]!=null).map(s=>`<div class="r"><span><span class="sw" style="background:${s.c}"></span>${esc(s.n)}</span><b>${yfmt(s.v[bi])}</b></div>`).join('');
-   showTip(e,(tipx?tipx(bi):`<b>${xfmt(x[bi])}</b>`)+rows+(stacked?`<div class="r"><span>total</span><b>${yfmt(cum[cum.length-1][bi])}</b></div>`:''))});
-  hit.addEventListener('mouseleave',()=>{cross.setAttribute('visibility','hidden');hideTip()})};
- draw();new ResizeObserver(()=>draw()).observe(host)}
-
-function tile(kk,v,s='',cls=''){return `<div class="tile"><div class="k">${kk}</div><div class="v ${cls}">${v}</div><div class="s">${s}</div></div>`}
+TEMPLATE_JS = r"""const S=D.stats,catIdx=Object.fromEntries(D.cats.map((c,i)=>[c.key,i])),catCol=k=>col(catIdx[k]);
 const tot=Object.values(D.final).reduce((a,b)=>a+b,0)||1,gsum=Object.values(D.growth).reduce((a,b)=>a+b,0)||1;
 const pk=S.peak_pct,pkc=pk>=85?'bad':pk>=65?'warn':'';
-let h=`<h1>${esc(D.title)}</h1><div class="sub">${esc(D.project)} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span> · report on <b>${D.trigger}</b> · ${esc(D.log)}</div>`;
+const who=D.worker&&D.worker!=='main'?`${esc(D.project)} / <b>${esc(D.worker)}</b>`:esc(D.project);
+const merge={yes:'merged',conflict:'<span class="warn">merge conflict</span>',parked:'<span class="bad">parked</span>',nothing:'no changes'}[D.merged]||'';
+let h=`<h1>${esc(D.title)}</h1><div class="sub">${who} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
 h+='<div class="tiles">'+[
- tile('Peak context',k(S.peak),`${pk}% of ${k(D.window)} window`,pkc),
+ tile('Peak context',k(S.peak),`${pk}% of ${k(D.window)} window${S.real_peak?` · Ollama saw ${k(S.real_peak)}`:''}`,pkc),
  tile('Thinking share',S.think_pct+'%','of all context growth'),
  tile('Turns',S.turns,`${S.compactions} compaction${S.compactions==1?'':'s'} · ${S.retries} retr${S.retries==1?'y':'ies'}`,S.retries?'warn':''),
  tile('Outcome',esc(S.outcome),S.cancelled?`${S.cancelled} request${S.cancelled>1?'s':''} cancelled`:'',S.outcome==='success'?'':'bad'),
  tile('Generation',S.gen_tps?f1(S.gen_tps)+' t/s':'–',`${k(S.gen_tok)} tokens out · median`),
  tile('Prefill',S.pp_tps?k(S.pp_tps)+' t/s':'–',`cache reuse ${S.reuse_pct??'–'}% · ${S.full_reprocess} full reprocess`,S.full_reprocess>S.requests/3?'warn':''),
+ D.share?tile('GPU share',D.share.mine_pct+'%',`of busy GPU time · ${D.share.agents} agent${D.share.agents>1?'s':''} · overlap ${D.share.overlap_pct}%`):'',
  tile('GPU util',S.util_avg!=null?S.util_avg+'%':'–','average, all GPUs'),
  tile('VRAM peak',S.vram_peak!=null?f1(S.vram_peak)+' GB':'–',`of ${S.vram_cap||'–'} GB · ${S.power_avg??'–'} W avg · ${S.energy_wh} Wh`),
 ].join('')+'</div>';
@@ -546,6 +428,9 @@ h+=card('Where the wall-clock time went',`${mins(S.wall_min)} total over ${S.req
  '<div class="bar100">'+tw.map(t=>`<div style="flex:${t[1]};background:${t[2]}" data-t="${esc(t[0])}: ${mins(t[1]/60)} (${Math.round(100*t[1]/tws)}%)"></div>`).join('')+'</div>'+
  legend(tw.map(t=>({n:`${t[0]} ${Math.round(100*t[1]/tws)}% · ${mins(t[1]/60)}`,c:t[2]}))));
 
+if(D.share)h+=card('Shared GPU during this run',`Every agent's model requests on the same Ollama; this run is <b>${esc(D.tag)}</b>. Solid = generating, faded = reading the prompt. While requests overlap, each is charged an equal part of the GPU time.`,
+ '<div id="lanes"></div><table style="margin-top:8px"><tr><th>Agent</th><th class="num">Requests</th><th class="num">GPU time</th><th class="num">Share</th></tr>'+
+ D.share.rows.map(r=>`<tr><td><span class="sw" style="background:${r.tag===D.tag?col(0):'var(--muted)'}"></span>${esc(r.tag)}</td><td class="num">${r.n}</td><td class="num">${mins(r.s/60)}</td><td class="num">${r.pct}%</td></tr>`).join('')+'</table>');
 h+=card('Context over the run','Measured prompt size per API call; split by what was added since the previous call (char-proportional). Hover for the breakdown.',
  '<div id="ctx"></div>'+legend(D.cats.map((c,i)=>({n:c.name,c:col(i)}))));
 
@@ -559,7 +444,7 @@ h+='<div class="grid2">'+card('Context at the end',`${k(tot)} tokens — what th
 
 h+='<div class="grid2">'+card('Model requests: time per request','Seconds spent reading the prompt vs generating; cancelled requests are the tall bars that never finish',
  '<div id="rtime"></div>'+legend([{n:'Prefill',c:col(0)},{n:'Generation',c:col(1)}]))
- +card('Model requests: prompt cache','Prompt tokens reused from Ollama\\'s cache vs re-processed from scratch',
+ +card('Model requests: prompt cache','Prompt tokens reused from Ollama\'s cache vs re-processed from scratch',
  '<div id="rcache"></div>'+legend([{n:'Reused',c:col(2)},{n:'Re-processed',c:col(7)}]))+'</div>';
 
 const G=D.gpu,gid=G.ids.map((g,i)=>({n:'GPU '+g,c:col(i)}));
@@ -577,6 +462,8 @@ h+=card('Per-turn data','','<details><summary>Turn-by-turn table ('+D.calls.leng
  '<details><summary>Model requests ('+D.reqs.length+' rows)</summary><div class="scroll"><table><tr><th class="num">Min</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Prefill s</th><th class="num">Gen tok</th><th class="num">Gen s</th><th class="num">t/s</th><th>Flags</th></tr>'+
  D.reqs.map(r=>`<tr><td class="num">${f1(r.min)}</td><td class="num">${k(r.prompt)}</td><td class="num">${k(r.reused)}</td><td class="num">${f1(r.prefill_s)}</td><td class="num">${r.gen}</td><td class="num">${f1(r.gen_s)}</td><td class="num">${f1(r.tps)}</td><td>${[r.full?'full reprocess':'',r.cancelled?'cancelled':''].filter(Boolean).join(', ')}</td></tr>`).join('')+'</table></div></details>');
 app.innerHTML=h;
+if(D.share)lanes(document.getElementById('lanes'),{x1:S.wall_min,xfmt:v=>Math.round(v)+'m',
+ lanes:D.share.lanes.map(l=>({name:l.tag,c:l.tag===D.tag?col(0):'var(--muted)',runs:l.runs,reqs:l.reqs}))});
 
 document.querySelectorAll('[data-t]').forEach(n=>{n.addEventListener('mousemove',e=>showTip(e,esc(n.dataset.t)));n.addEventListener('mouseleave',hideTip)});
 const C=D.calls;
@@ -593,16 +480,7 @@ const gx={x:G.t,xfmt:v=>Math.round(v)+'m',H:170,tipx:i=>`<b>${mins(G.t[i])}</b>`
 chart(document.getElementById('gu'),{...gx,ymax:100,yfmt:v=>Math.round(v)+'%',series:G.ids.map((g,i)=>({n:'GPU '+g,c:col(i),v:G.util[i]}))});
 chart(document.getElementById('gv'),{...gx,ymax:G.ids.length?G.cap_gb/G.ids.length:null,yfmt:v=>f1(v),series:G.ids.map((g,i)=>({n:'GPU '+g,c:col(i),v:G.vram[i]}))});
 chart(document.getElementById('gp'),{...gx,yfmt:v=>Math.round(v)+'W',series:G.ids.map((g,i)=>({n:'GPU '+g,c:col(i),v:G.power[i]}))});
-</script></body></html>"""
-
-INDEX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent run reports</title>
-<style>""" + CSS + """</style></head><body><main><h1>Agent run reports</h1>
-<div class="sub">One row per report — written at the end of each run and at every compaction. Newest first.</div>
-<section class="card" style="overflow-x:auto"><table><tr><th>Start</th><th>Project</th><th>Task</th><th>Trigger</th>
-<th class="num">Min</th><th class="num">Turns</th><th class="num">Peak ctx</th><th class="num">Thinking</th>
-<th class="num">Gen t/s</th><th class="num">GPU %</th><th>Outcome</th></tr>
-__ROWS__</table></section></main></body></html>"""
+"""
 
 if __name__ == "__main__":
     main()

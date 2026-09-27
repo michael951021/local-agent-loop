@@ -28,6 +28,49 @@ Full transcripts are in `logs/*.jsonl`. Each finished task gets a 3-line entry (
 blockers) appended to `projects/NAME/TASKLOG.md`; `projects/NAME/NOTES.md` is the rolling
 current-state handoff the next iteration reads, not a log.
 
+## Parallel agents
+
+`./agent loop NAME` starts `AGENTS` agents (config.env, default 2; `-j N` overrides). With one, the
+agent works in `projects/NAME` itself. With more, each agent gets a git worktree `work/NAME/wK` on
+branch `agent/wK`, and they split up TODO.md:
+
+- **Claiming.** `sched.py` hands each agent the first open task that nobody holds and whose
+  dependencies are done. Claims live in `run/NAME/` and die with the agent.
+- **Dependencies.** `(id: x)` names a task, `(after: x, y)` makes it wait for those; `(after: -)`
+  means none. A line without `(after: ...)` waits for every open line above it, so an untagged
+  TODO.md is worked top-down, exactly like a single agent.
+- **Merging.** After each task the agent's branch is merged into the project branch under a lock.
+  TODO.md, NOTES.md and TASKLOG.md merge line by line (`mergelines.py`); a real code conflict is
+  handed back to the same agent as its next run, and parked on a branch if it fails twice.
+- **Shared data.** Gitignored paths listed in `projects/NAME/.agent-shared` (venvs, clones,
+  databases) are mounted into every agent's sandbox from the main checkout.
+- **Tmux.** Each agent gets a pane (the current window if you are in tmux, else a new session).
+
+```bash
+./agent status contrib-loop       # who is on what, and what each open task waits for
+./agent stop contrib-loop         # stop after the current tasks (--now: immediately)
+./agent worker contrib-loop       # add one more agent to a running loop
+AGENTS=1 ./agent loop other       # a second, single-agent loop on another project
+```
+
+Ollama must serve `NUM_PARALLEL` requests at once; `./agent setup` checks the systemd setting and
+prints the one root command that changes it. Each slot owns a KV cache of `NUM_CTX` tokens.
+`tests/smoke.sh` exercises all of this with a fake `claude` in about a minute.
+
+## Reports
+
+Every run gets `reports/<project>/<time>-[<agent>-]<session>-end.html` (and one per context
+compaction); `reports/index.html` lists them and `reports/fleet.html` shows all agents on one
+timeline with their share of the GPUs. Copy the folder anywhere to view it: the pages are
+self-contained.
+
+| Layer | Files | Job |
+|---|---|---|
+| Record | `./agent` (harness lines in `logs/*.jsonl`), `keepalive.py` (`logs/requests/`), `gpumon.py` (`logs/gpu/`), Ollama's journal | write facts as they happen, tagged by agent |
+| Read | `telemetry.py` | parse and join them: runs, requests per agent, fair GPU share, VRAM split |
+| Render | `reportui.py`, `ctxreport.py`, `fleet.py` | per-run page, index, fleet page |
+| Trigger | `./agent` (end of run), `pretty.py` (compaction) | call the renderer; never block the agent |
+
 ## What the sandbox allows
 
 | | Inside the sandbox |
