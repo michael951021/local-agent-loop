@@ -42,6 +42,23 @@ AFTER = re.compile(r"\(after: *([^)]*)\)")
 CHECKLIST = re.compile(r"\(checklist: ([^) ]+)\)")
 
 
+TITLE = re.compile(r"^\*\*(.+?)\*\*\s*(?:—\s*)?(.*)$")
+TAGS = re.compile(r"\s*\((?:id|after|checklist): *[^)]*\)")
+
+
+def split_title(text):
+    """(title, spec) of a task line: `**Title** — spec (tags)`. Older lines without a title get a short
+    head (up to the first colon, else ~70 characters) as title."""
+    text = TAGS.sub("", text or "").strip()
+    m = TITLE.match(text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    head = text.split(": ", 1)[0]
+    if len(head) > 70:
+        head = text[:70].rsplit(" ", 1)[0] + "…"
+    return head, text
+
+
 def env_int(name, default):
     try:
         return int(os.environ.get(name, default))
@@ -240,7 +257,7 @@ def cmd_next(st, worker, d, ref):
                 i = todo_open.index(entry["text"])
                 job["todo_next"] = todo_open[i + 1:i + 3]
             others = [(c["worker"], c["task"]) for c in claims.values()]
-            job.update(key=entry["key"], akey=akey, attempts=n, open=len(rows), unknown=entry["unknown"],
+            job.update(title=split_title(job["task"])[0], key=entry["key"], akey=akey, attempts=n, open=len(rows), unknown=entry["unknown"],
                        step_abandon=bool(job["parent"] and max_step and n > max_step),
                        resumed=bool(resume and entry["key"] == resume["key"]),
                        prompt=prompt(files, job, n, bool(job["parent"] and max_step and n > max_step), others,
@@ -283,15 +300,15 @@ def cmd_status(st, d, ref):
         c = st.load(f"workers/{f.name}", {})
         up = alive(c.get("pid"))
         mins = (time.time() - c.get("since", time.time())) / 60
-        print(f"{c.get('worker', f.stem):6} {'running' if up else 'gone':8} {mins:5.0f} min  {c.get('task', '')[:100]}")
+        print(f"{c.get('worker', f.stem):6} {'running' if up else 'gone':8} {mins:5.0f} min  {split_title(c.get('task', ''))[0][:100]}")
     for f in sorted((st.d / "workers").glob("*.resume")):
         r = st.load(f"workers/{f.name}", {})
-        print(f"{f.stem:6} {'paused':8}            {r.get('task', '')[:100]}\n{'':25}handoff: {(r.get('handoff') or '-')[:300]}")
+        print(f"{f.stem:6} {'paused':8}            {split_title(r.get('task', ''))[0][:100]}\n{'':25}handoff: {(r.get('handoff') or '-')[:300]}")
     rows = plan(files, claims, failed)
     print(f"\n{len(rows)} open tasks")
     for entry, state, why in rows[:15]:
-        extra = f" ({why[:60]})" if why and state != "ready" else ""
-        print(f"  {state:14} L{entry['line']:<4} {entry['text'][:90]}{extra}")
+        extra = f"  ← {split_title(why)[0][:50]}" if why and state not in ("ready", "claimed") else f" ({why})" if why else ""
+        print(f"  {state:14} L{entry['line']:<4} {split_title(entry['text'])[0][:70]}{extra}")
 
 
 def main():

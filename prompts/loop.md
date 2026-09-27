@@ -24,6 +24,8 @@ and use `head`, `grep` or line ranges instead of whole large files.
    unfinished: the harness hands out the next task, and other agents may already be working on it.
 
 If the task is too large, replace its line (in the same file) with smaller `- [ ]` tasks, do the first one, and stop.
+Write every new task line as `- [ ] **Short title** — spec`: a 4-7 word title that makes sense on its own (reports
+show only the title), then what to build with the technical specifics, as briefly as they can be said.
 Put the old line's `(after: ...)` tag on the first new line and its `(id: ...)` tag on the last one.
 
 Other agents may be working on other tasks at the same time, each in its own git worktree; their tasks are

@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 import reportui
-from telemetry import (prompt_tokens, result, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
+from telemetry import (prompt_tokens, result, task_title, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
                        guess_task, harness_runs, ledger, log_runs, ollama_requests, read_session)
 
 REPORTS = ROOT / "reports"
@@ -210,7 +210,7 @@ def timeline(all_reqs, runs, t0, t1, mine, prefix="../"):
         by[agent_tag(st)]["runs"].append({
             "a": round((max(st["t"], t0) - t0) / 60, 3), "b": round((min(b, t1) - t0) / 60, 3),
             "href": prefix + href if href else None,
-            "t": f"<b>{html.escape(agent_tag(st))}</b> · {html.escape(clean_task(st.get('task'))[:140] or 'run')}"
+            "t": f"<b>{html.escape(agent_tag(st))}</b> · {html.escape(task_title(st.get('task'), st.get('project'))[0] or 'run')}"
                  f"<div class='note'>{(b - st['t']) / 60:.0f} min{' · ' + en['merged'] if en and en.get('merged') not in (None, 'n/a') else ''}"
                  f"{' · click for its report' if href else ''}</div>"})
     return [{"tag": t, **v} for t, v in sorted(by.items(), key=lambda kv: lane_order(kv[0], mine))]
@@ -251,10 +251,12 @@ def build(log, sid, trigger, run=None):
 
     gpu = gpu_samples(t0, t1)
     if start and start.get("task"):
-        task = ("Merge fix: " if start.get("merge_fix") else "") + clean_task(start["task"])
+        title, spec = task_title(start["task"], project)
+        task = ("Merge fix: " if start.get("merge_fix") else "") + title
         cs = commits(project, start.get("base"), (end or {}).get("head"))
     else:
         task, cs = guess_task(project, t0, t1)
+        spec = None
     # The window each request really had (Ollama logs it), else what the harness was configured with.
     window = max((r["n_ctx"] for r in reqs), default=None) or (start or {}).get("num_ctx") or config("NUM_CTX", 131072)
     peak = max(c["total"] for c in a["calls"])
@@ -287,7 +289,7 @@ def build(log, sid, trigger, run=None):
 
     begun = datetime.fromtimestamp(t0)
     data = {
-        "title": task or f"session {sid[:8]}",
+        "title": task or f"session {sid[:8]}", "spec": spec,
         "project": project, "worker": worker, "tag": tag, "sid": sid, "trigger": trigger, "log": log.name,
         "branch": (start or {}).get("branch"), "merged": (end or {}).get("merged"),
         # What became of the task, in plain words; the agent's own note when it did not finish.
@@ -332,7 +334,7 @@ def build(log, sid, trigger, run=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     name = f"{begun.strftime('%Y%m%d-%H%M')}-{'' if worker == 'main' else worker + '-'}{sid[:8]}-{trigger}"
     (out_dir / f"{name}.html").write_text(reportui.page(data["title"][:80], data, TEMPLATE_JS))
-    summary = {k: data[k] for k in ("title", "project", "worker", "tag", "start", "trigger", "merged", "result",
+    summary = {k: data[k] for k in ("title", "spec", "project", "worker", "tag", "start", "trigger", "merged", "result",
                                     "note", "attempt")} | {
         "run": (start or {}).get("run"), "share_pct": share and share["mine_pct"]} | {
         k: data["stats"][k] for k in ("wall_min", "turns", "peak_pct", "think_pct", "gen_tps", "util_avg", "outcome",
@@ -364,7 +366,7 @@ def build_index():
                             f'{s["retries"]} retries' if s["retries"] else "") if x]
         rows.append(
             f'<tr><td class="num">{s["start"]}</td><td>{html.escape(who)}</td>'
-            f'<td><a href="{f.parent.name}/{f.stem}.html">{html.escape(short(s["title"], 90))}</a>{note}</td>'
+            f'<td><a href="{f.parent.name}/{f.stem}.html" title="{html.escape(s.get("spec") or "")}">{html.escape(short(s["title"], 90))}</a>{note}</td>'
             f'<td>{tries}</td>'
             f'<td><span class="{r["cls"]}" title="{html.escape(r["why"])}"><b>{html.escape(r["label"])}</b></span>'
             f'<div class="note">{html.escape(r["why"])}{" · " + " · ".join(side) if side else ""}</div></td>'
@@ -433,7 +435,7 @@ const tot=Object.values(D.final).reduce((a,b)=>a+b,0)||1,gsum=Object.values(D.gr
 const pk=S.peak_pct,pkc=pk>=85?'bad':pk>=65?'warn':'';
 const who=D.worker&&D.worker!=='main'?`${esc(D.project)} / <b>${esc(D.worker)}</b>`:esc(D.project);
 const merge={yes:'merged',conflict:'<span class="warn">merge conflict</span>',parked:'<span class="bad">parked</span>',nothing:'no changes'}[D.merged]||'';
-let h=`<h1>${esc(D.title)}</h1><div class="sub">${who} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
+let h=`<h1>${esc(D.title)}</h1>${D.spec&&D.spec!==D.title?`<div class="note" style="max-width:900px;margin:-4px 0 8px">${esc(D.spec)}</div>`:''}<div class="sub">${who} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
 h+='<div class="tiles">'+[
  tile('Peak context',k(S.peak),`${pk}% of ${k(D.window)} window${S.real_peak?` · the server saw ${k(S.real_peak)}`:''}`,pkc),
  tile('Thinking share',S.think_pct+'%','of all context growth'),

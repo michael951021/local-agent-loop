@@ -30,6 +30,48 @@ def clean_task(t):
     return TAGS.sub("", t or "").strip()
 
 
+def _split_title():
+    import importlib.util   # sched.py, not the standard library's sched module
+    spec = importlib.util.spec_from_file_location("agent_sched", ROOT / "sched.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.split_title
+
+
+split_title = _split_title()
+_titles = {}
+
+
+def task_title(task, project=None):
+    """(title, spec) for display. Runs recorded before TODO lines had titles get the current title of
+    the same (id: x) line."""
+    title, spec = split_title(task)
+    if not project or (task or "").lstrip().startswith("**"):
+        return title, spec
+    if project not in _titles:   # current titled lines: by (id: x), and all of them for fuzzy matching
+        by_id, all_ = {}, []
+        todo = ROOT / "projects" / project / "TODO.md"
+        for line in (todo.read_text().splitlines() if todo.exists() else []):
+            if "**" not in line:
+                continue
+            ts = split_title(re.sub(r"^\s*- \[.\] ", "", line))
+            i = re.search(r"\(id: *([\w.-]+)\)", line)
+            if i:
+                by_id[i.group(1)] = ts
+            all_.append(ts)
+        _titles[project] = (by_id, all_)
+    by_id, all_ = _titles[project]
+    m = re.search(r"\(id: *([\w.-]+)\)", task or "")
+    if m and m.group(1) in by_id:
+        return by_id[m.group(1)]
+    # Untagged lines were reworded when titles were added: take the current line sharing the most words.
+    words = lambda t: set(re.findall(r"[a-z0-9_.\-/]{3,}", t.lower()))
+    old = words(clean_task(task))
+    sim = lambda ts: len(old & words(ts[0] + " " + ts[1])) / max(1, len(old | words(ts[0] + " " + ts[1])))
+    best = max(all_, key=sim, default=None)
+    return best if best and sim(best) >= 0.25 else (title, spec)
+
+
 def config(name, default):
     m = re.search(rf"^{name}=\$?{{?(?:{name}:-)?(\d+)", (ROOT / "config.env").read_text(), re.M)
     return int(m.group(1)) if m else default

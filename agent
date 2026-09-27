@@ -440,7 +440,8 @@ cmd_worker() {
     [[ "$(jq -r '.resumed // false' <<<"$j")" == true ]] && fix=" · continuing an interrupted run"
     echo -e "\n\033[1m━━ $name/$wid · iteration $i/$of · $(jq -r '.open // "?"' <<<"$j") open · attempt $(jq -r '.attempts // 1' <<<"$j")$fix ━━\033[0m"
     [[ -n "$(jq -r '.parent // empty' <<<"$j")" ]] && echo -e "\033[2m$(jq -r '.src + " ← " + .parent[:100]' <<<"$j")\033[0m"
-    echo -e "\033[2m$task\033[0m"
+    local ttl; ttl="$(jq -r '.title // empty' <<<"$j")"
+    if [[ -n "$ttl" && "$ttl" != "$task" ]]; then echo -e "\033[1m$ttl\033[0m \033[2m— ${task#*— }\033[0m"; else echo -e "\033[2m$task\033[0m"; fi
 
     local rid base n0; rid="$(date +%s)-$wid-$RANDOM"; base="$(git -C "$wt" rev-parse HEAD)"
     n0=0; [[ -f "$log" ]] && n0="$(wc -l < "$log")"

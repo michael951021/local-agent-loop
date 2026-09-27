@@ -15,7 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import reportui
-from telemetry import (ROOT, result, task_state, agent_tag, attribute, clean_task, fair_share, gpu_samples, harness_runs, ledger,
+from telemetry import (ROOT, result, task_title, task_state, agent_tag, attribute, clean_task, fair_share, gpu_samples, harness_runs, ledger,
                        ollama_requests, vram_budget)
 
 REPORTS = ROOT / "reports"
@@ -93,7 +93,7 @@ def build(hours=24):
         href = links.get(st["run"])
         lanes[tag]["runs"].append({
             "a": round((st["t"] - t0) / 60, 3), "b": round((b - t0) / 60, 3), "href": href,
-            "t": f"<b>{html.escape(tag)}</b> · {html.escape(clean_task(st.get('task'))[:140] or 'run')}"
+            "t": f"<b>{html.escape(tag)}</b> · {html.escape(task_title(st.get('task'), st.get('project'))[0] or 'run')}"
                  f"<div class='note'>{time.strftime('%H:%M', time.localtime(st['t']))} · {(b - st['t']) / 60:.0f} min"
                  f" · {result(st, en)[0]}{' · click for its report' if href else ''}</div>"
                  + (f"<div class='note'>{html.escape(en['note'])}</div>" if en and en.get("note") else "")})
