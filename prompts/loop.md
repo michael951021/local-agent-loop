@@ -20,6 +20,8 @@ and use `head`, `grep` or line ranges instead of whole large files.
    - Approach: how you did it
    - Blockers: any big blocker hit (looping/retrying, missing context, flaky tests, tooling gaps), or "none"
 6. git commit with a message describing the task.
+7. End the run with a one-line summary. Do not go on to another TODO line, even one that looks related or
+   unfinished: the harness hands out the next task, and other agents may already be working on it.
 
 If the task is too large, replace its line (in the same file) with smaller `- [ ]` tasks, do the first one, and stop.
 Put the old line's `(after: ...)` tag on the first new line and its `(id: ...)` tag on the last one.

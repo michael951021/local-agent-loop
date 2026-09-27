@@ -125,6 +125,7 @@ sandbox() {
     --setenv OLLAMA_BASE_URL "http://127.0.0.1:$api_port/v1"
     --setenv OLLAMA_HOST "http://127.0.0.1:$api_port"
     ${SB_BINDS[@]+"${SB_BINDS[@]}"}
+    ${SB_ENV[@]+"${SB_ENV[@]}"}
   )
   [[ $tty == 0 ]] && args+=(--new-session)
   # The token goes in through a 0600 file, not --setenv: bwrap's argv is visible to every user in `ps`.
@@ -364,7 +365,7 @@ cmd_worker() {
   local n; n="$(live_workers | wc -l)"
   ((n > NUM_PARALLEL)) && echo "warning: $n agents running but the model server runs NUM_PARALLEL=$NUM_PARALLEL at a time; requests will queue" >&2
 
-  local wt="$dir" main="" tag="$name" ref=() SB_BINDS=() SB_WORKER="$wid" SB_TAG
+  local wt="$dir" main="" tag="$name" ref=() SB_BINDS=() SB_ENV=() SB_WORKER="$wid" SB_TAG
   local log="$LOGS/$name-$(date +%Y%m%d-%H%M%S).jsonl"
   if [[ "$wid" != main ]]; then
     main="$(git -C "$dir" symbolic-ref --short HEAD)"
@@ -440,9 +441,15 @@ cmd_worker() {
       --argjson n "$(live_workers "$name" | wc -l)" --argjson np "$NUM_PARALLEL" --argjson ctx "$NUM_CTX" \
       '{project: $p, worker: $w, workdir: $d, base: $b, branch: $br, agents: $n, num_parallel: $np, num_ctx: $ctx,
         task: .task, src: .src, parent: .parent, attempts: .attempts, merge_fix: ($c > 0)}' <<<"$j")"
+    # hooks/task_done.py tells the agent to stop once this line is checked (merge-fix runs have no task).
+    local src; src="$(jq -r '.src // "TODO.md"' <<<"$j")"
+    SB_ENV=(); ((conflict)) || SB_ENV=(--setenv AGENT_TASK "$task" --setenv AGENT_TASK_SRC "$src")
     headless "$wt" "$prompt" "$log" "$rid" || echo "(run exited non-zero)"
-    local head merged="n/a"
-    if ((conflict == 0)) && ! tail -n "+$((n0 + 1))" "$log" | grep -q '"type":"result"'; then   # key order varies
+    SB_ENV=()
+    local head merged="n/a" checked=0
+    grep -qiF -- "- [x] $task" "$wt/$src" 2>/dev/null && checked=1
+    # Cut off after its task was checked (it ran on past it): that is a finished run, merge it.
+    if ((conflict == 0 && checked == 0)) && ! tail -n "+$((n0 + 1))" "$log" | grep -q '"type":"result"'; then   # key order varies
       pause_task "$wt" "$st" "$wid" "$(tail -n "+$((n0 + 1))" "$log" | grep -m1 '"subtype":"init"' | jq -r .session_id)" \
         "$(cat "$st/workers/$wid.json" 2>/dev/null || echo '{}')"
       merged="paused"
