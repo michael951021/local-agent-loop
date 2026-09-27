@@ -147,7 +147,7 @@ cmd_setup() {
   echo "ready: $MODEL ($BASE_MODEL, ctx $NUM_CTX per request)"
   # NUM_PARALLEL is a server setting (one KV cache of NUM_CTX per slot), so it lives in systemd.
   local cur conf=/etc/systemd/system/ollama.service.d/parallel.conf
-  cur="$(systemctl show ollama -p Environment --value 2>/dev/null | grep -oE 'OLLAMA_NUM_PARALLEL=[0-9]+' | cut -d= -f2)"
+  cur="$(systemctl show ollama -p Environment --value 2>/dev/null | grep -oE 'OLLAMA_NUM_PARALLEL=[0-9]+' | cut -d= -f2 || true)"
   [[ "${cur:-1}" == "$NUM_PARALLEL" ]] && return 0
   echo "Ollama serves ${cur:-1} request(s) at a time; config.env has NUM_PARALLEL=$NUM_PARALLEL. This needs root:"
   local cmds="sudo mkdir -p ${conf%/*} && printf '[Service]\\nEnvironment=\"OLLAMA_NUM_PARALLEL=$NUM_PARALLEL\"\\n' | sudo tee $conf >/dev/null && sudo systemctl daemon-reload && sudo systemctl restart ollama"
