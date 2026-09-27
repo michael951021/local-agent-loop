@@ -7,7 +7,8 @@
 #   ./agent loop  NAME [ITERS] [-j N]  work through TODO.md with N agents (default AGENTS)
 #   ./agent worker NAME [ID] [ITERS]   add one agent to NAME's running loop
 #   ./agent status [NAME]         agents, their tasks, and what each open task waits on
-#   ./agent stop  NAME [--now]    stop NAME's agents after their current task (--now: at once)
+#   ./agent stop  NAME [--now|--kill]  stop after the current task; --now: interrupt, write a 2-line
+#                                 handoff and continue that task next time; --kill: no handoff yet
 #   ./agent run   NAME "PROMPT"   one headless run with a custom prompt
 #   ./agent shell NAME            bash inside the sandbox (to poke around)
 #   ./agent list                  list projects
@@ -26,7 +27,11 @@ PROJECTS="$ROOT/projects"
 LOGS="$ROOT/logs"
 RUN="$ROOT/run"
 CLAUDE_BIN="$(readlink -f "${AGENT_CLAUDE_BIN:-$(command -v claude)}")"   # AGENT_CLAUDE_BIN: tests use a fake
-OLLAMA_PORT="${OLLAMA_URL##*:}"
+# BACKEND=ollama: Ollama serves MODEL. BACKEND=llama: ./llamasrv runs the same GGUF on llama-server,
+# which gives NUM_PARALLEL real slots (Ollama runs qwen35 models one request at a time).
+: "${BACKEND:=ollama}" "${LLAMA_URL:=http://127.0.0.1:11500}"
+API_URL="$OLLAMA_URL"; [[ "$BACKEND" == llama ]] && API_URL="$LLAMA_URL"
+API_PORT="${API_URL##*:}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -38,6 +43,11 @@ project_dir() {
 }
 
 check_ollama() {
+  if [[ "$BACKEND" == llama ]]; then
+    curl -sf "$LLAMA_URL/health" >/dev/null || "$ROOT/llamasrv" start >&2 || die "llama-server did not start (./llamasrv logs)"
+    return 0
+  fi
+  ! systemctl --user is-active -q llama-agent 2>/dev/null || die "BACKEND=ollama but llama-server holds the GPUs (./llamasrv stop)"
   curl -sf "$OLLAMA_URL/api/version" >/dev/null || die "Ollama not reachable at $OLLAMA_URL"
   ollama list | awk '{print $1}' | grep -qx "$MODEL:latest" || die "model '$MODEL' missing — run: ./agent setup"
 }
@@ -55,13 +65,13 @@ sandbox() {
   mkdir -p "$RUN" "$LOGS"
   local kafile ka_pid ka_port status=0
   kafile="$(mktemp "$RUN/keepalive.XXXXXX")"
-  python3 "$ROOT/keepalive.py" 0 "127.0.0.1:$OLLAMA_PORT" --tag "${SB_TAG:-$(basename "$proj")}" \
+  python3 "$ROOT/keepalive.py" 0 "127.0.0.1:$API_PORT" --tag "${SB_TAG:-$(basename "$proj")}" \
     > "$kafile" 2>>"$LOGS/keepalive.log" &
   ka_pid=$!
   for _ in {1..50}; do [[ -s "$kafile" ]] && break; sleep 0.1; done
   ka_port="$(head -1 "$kafile")"; rm -f "$kafile"
   [[ -n "$ka_port" ]] || { kill "$ka_pid" 2>/dev/null; die "keepalive proxy failed to start"; }
-  local api_port="$ka_port"; [[ "$NET" == "on" ]] || api_port="$OLLAMA_PORT"   # NET=off: bridge listens there
+  local api_port="$ka_port"; [[ "$NET" == "on" ]] || api_port="$API_PORT"   # NET=off: bridge listens there
 
   local args=(
     --ro-bind /usr /usr
@@ -108,6 +118,7 @@ sandbox() {
     --setenv GIT_COMMITTER_NAME agent --setenv GIT_COMMITTER_EMAIL agent@sandbox
     --setenv NPM_CONFIG_PREFIX /home/agent/.local
     --setenv AGENT_WORKER "${SB_WORKER:-main}"
+    --setenv AGENT_BACKEND "$BACKEND"
     ${SB_BINDS[@]+"${SB_BINDS[@]}"}
   )
   [[ $tty == 0 ]] && args+=(--new-session)
@@ -131,7 +142,7 @@ sandbox() {
     for _ in {1..50}; do [[ -S "$sock" ]] && break; sleep 0.1; done
     args+=(--bind "$sock" /run/ollama.sock)
     bwrap "${args[@]}" bash -c \
-      "python3 /opt/agent/bridge.py in /run/ollama.sock $OLLAMA_PORT & sleep 0.3; exec \"\$@\"" _ "$@" \
+      "python3 /opt/agent/bridge.py in /run/ollama.sock $API_PORT & sleep 0.3; exec \"\$@\"" _ "$@" \
       || status=$?
     kill "$bridge_pid" 2>/dev/null || true
     rm -f "$sock"
@@ -148,10 +159,15 @@ cmd_setup() {
   printf 'FROM %s\nPARAMETER num_ctx %s\n' "$BASE_MODEL" "$NUM_CTX" > "$RUN/Modelfile"
   ollama create "$MODEL" -f "$RUN/Modelfile"
   echo "ready: $MODEL ($BASE_MODEL, ctx $NUM_CTX per request)"
-  # NUM_PARALLEL is a server setting (one KV cache of NUM_CTX per slot), so it lives in systemd.
+  if [[ "$BACKEND" == llama ]]; then
+    echo "BACKEND=llama: ./llamasrv serves $NUM_PARALLEL slots x $NUM_CTX from this model's GGUF (no root needed)"
+    return 0
+  fi
+  # With Ollama, NUM_PARALLEL is a server setting (one KV cache of NUM_CTX per slot) that lives in systemd.
+  # Ollama ignores it for models it cannot run in parallel (qwen35: use BACKEND=llama).
   local cur conf=/etc/systemd/system/ollama.service.d/parallel.conf
   cur="$(systemctl show ollama -p Environment --value 2>/dev/null | grep -oE 'OLLAMA_NUM_PARALLEL=[0-9]+' | cut -d= -f2 || true)"
-  [[ "${cur:-1}" == "$NUM_PARALLEL" ]] && return 0
+  ((${cur:-1} >= NUM_PARALLEL)) && return 0
   echo "Ollama serves ${cur:-1} request(s) at a time; config.env has NUM_PARALLEL=$NUM_PARALLEL. This needs root:"
   local cmds="sudo mkdir -p ${conf%/*} && printf '[Service]\\nEnvironment=\"OLLAMA_NUM_PARALLEL=$NUM_PARALLEL\"\\n' | sudo tee $conf >/dev/null && sudo systemctl daemon-reload && sudo systemctl restart ollama"
   echo "  $cmds"
@@ -221,6 +237,38 @@ autocommit() {
   [[ -n "$(git -C "$dir" status --porcelain)" ]] || return 1
   git -C "$dir" add -A
   git -C "$dir" -c user.name=agent -c user.email=agent@sandbox commit -qm "$msg"
+}
+
+# ── interrupted runs ──────────────────────────────────────────────────────────
+# A run that ends without a result (./agent stop --now, ITER_TIMEOUT, a crash) is paused, not merged:
+# its session is resumed once, without tools, to write a short handoff; its edits are committed on the
+# agent's branch; run/NAME/workers/ID.resume makes the same agent continue the task next time.
+HANDOFF_PROMPT="You are being stopped before this task is finished. Write a handoff for the agent that \
+will continue it: exactly 2 lines, at most 60 words in total, no preamble or formatting. \
+Line 1: what is done so far and how it works (files, approach). \
+Line 2: what is still needed to finish (next concrete steps, known problems)."
+
+handoff() {   # DIR SID → the note on stdout (empty if the session cannot be resumed)
+  [[ -n "$2" && "$2" != null ]] || return 0
+  sandbox "$1" -- timeout 20m claude -p "$HANDOFF_PROMPT" --resume "$2" --tools "" --max-turns 1 \
+      --output-format json "${claude_args[@]}" </dev/null 2>/dev/null |
+    jq -r '.result // empty' 2>/dev/null |
+    python3 -c 'import sys
+lines = [l.strip() for l in sys.stdin.read().splitlines() if l.strip()][:2]
+words, out = 80, []
+for l in lines:
+    w = l.split()[:words]; words -= len(w)
+    if w: out.append(" ".join(w))
+print("\n".join(out))' || true
+}
+
+pause_task() {   # DIR STATE WID SID CLAIM_JSON → writes STATE/workers/WID.resume
+  local dir="$1" st="$2" wid="$3" sid="$4" claim="$5" note
+  echo -e "\033[33m⏸ $wid: run interrupted — asking it for a handoff\033[0m"
+  note="$(handoff "$dir" "$sid")"
+  [[ -n "$note" ]] && echo -e "\033[2m$note\033[0m" || echo "(no handoff: the session could not be resumed)"
+  autocommit "$dir" "$wid: interrupted: $(jq -r '.task // "" | .[:60]' <<<"$claim")"$'\n\n'"$note" || true
+  jq --arg h "$note" --arg sid "$sid" '. + {handoff: $h, sid: $sid, paused: now}' <<<"$claim" > "$st/workers/$wid.resume"
 }
 
 # ── parallel agents ───────────────────────────────────────────────────────────
@@ -309,7 +357,7 @@ cmd_worker() {
   echo $$ > "$st/workers/$wid.pid"
   export AGENT_PID=$$ MAX_TASK_ATTEMPTS MAX_STEP_ATTEMPTS
   local n; n="$(live_workers | wc -l)"
-  ((n > NUM_PARALLEL)) && echo "warning: $n agents running but Ollama serves NUM_PARALLEL=$NUM_PARALLEL at a time; requests will queue" >&2
+  ((n > NUM_PARALLEL)) && echo "warning: $n agents running but the model server runs NUM_PARALLEL=$NUM_PARALLEL at a time; requests will queue" >&2
 
   local wt="$dir" main="" tag="$name" ref=() SB_BINDS=() SB_WORKER="$wid" SB_TAG
   local log="$LOGS/$name-$(date +%Y%m%d-%H%M%S).jsonl"
@@ -331,7 +379,15 @@ cmd_worker() {
     rm -f "$dir/DONE"
   fi
   SB_TAG="$tag"
-  trap 'python3 "$ROOT/sched.py" release "$st" "$wid"; rm -f "$st/workers/$wid.pid"' EXIT
+  trap "python3 '$ROOT/sched.py' release '$st' '$wid'; rm -f '$st/workers/$wid.pid'" EXIT   # expanded now: locals are gone at exit
+  if [[ ! -f "$st/workers/$wid.resume" ]]; then   # was this agent's last run killed before it ended?
+    local prev lr pat="$LOGS/$name-$wid-2*.jsonl"; [[ "$wid" == main ]] && pat="$LOGS/$name-2*.jsonl"
+    prev="$(ls -t $pat 2>/dev/null | head -1 || true)"
+    if [[ -n "$prev" ]] && lr="$(python3 "$ROOT/sched.py" lastrun "$prev")"; then
+      pause_task "$wt" "$st" "$wid" "$(jq -r .sid <<<"$lr")" "$lr"
+      run_end "$prev" "$(jq -r .rid <<<"$lr")" '{"merged": "paused"}'
+    fi
+  fi
   trap 'echo; echo "stopped."; exit 130' INT TERM
 
   local i=0 stuck=0 conflict=0 waited="" job="" task="" prompt rc
@@ -341,7 +397,9 @@ cmd_worker() {
       [[ -f "$dir/DONE" ]] && { echo "✔ all tasks done"; break; }
     elif ((conflict == 0)); then
       autocommit "$wt" "$wid: leftover changes" || true
-      if git -C "$wt" merge-base --is-ancestor HEAD "$main"; then
+      if [[ -f "$st/workers/$wid.resume" ]]; then
+        :   # an interrupted task: its work stays on the branch until the task is finished
+      elif git -C "$wt" merge-base --is-ancestor HEAD "$main"; then
         git -C "$wt" reset -q --hard "$main"
       else
         conflict=1   # unmerged work from an earlier run (e.g. a crash mid-merge)
@@ -369,16 +427,25 @@ cmd_worker() {
     [[ -n "$(jq -r '.parent // empty' <<<"$j")" ]] && echo -e "\033[2m$(jq -r '.src + " ← " + .parent[:100]' <<<"$j")\033[0m"
     echo -e "\033[2m$task\033[0m"
 
-    local rid base; rid="$(date +%s)-$wid-$RANDOM"; base="$(git -C "$wt" rev-parse HEAD)"
+    local rid base n0; rid="$(date +%s)-$wid-$RANDOM"; base="$(git -C "$wt" rev-parse HEAD)"
+    n0="$(wc -l < "$log" 2>/dev/null || echo 0)"
     run_begin "$log" "$rid" "$(jq -c --arg p "$name" --arg w "$wid" --arg d "$wt" --arg b "$base" \
       --arg br "$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null)" --argjson c "$conflict" \
       --argjson n "$(live_workers "$name" | wc -l)" --argjson np "$NUM_PARALLEL" --argjson ctx "$NUM_CTX" \
       '{project: $p, worker: $w, workdir: $d, base: $b, branch: $br, agents: $n, num_parallel: $np, num_ctx: $ctx,
         task: .task, src: .src, parent: .parent, attempts: .attempts, merge_fix: ($c > 0)}' <<<"$j")"
     headless "$wt" "$prompt" "$log" "$rid" || echo "(run exited non-zero)"
+    local head merged="n/a"
+    if ((conflict == 0)) && ! tail -n "+$((n0 + 1))" "$log" | grep -q '"type":"result"'; then   # key order varies
+      pause_task "$wt" "$st" "$wid" "$(tail -n "+$((n0 + 1))" "$log" | grep -m1 '"subtype":"init"' | jq -r .session_id)" \
+        "$(cat "$st/workers/$wid.json" 2>/dev/null || echo '{}')"
+      merged="paused"
+    fi
     autocommit "$wt" "$wid: ${task:0:70}" || true
-    local head merged="n/a"; head="$(git -C "$wt" rev-parse HEAD)"
-    if [[ "$wid" != main ]]; then
+    head="$(git -C "$wt" rev-parse HEAD)"
+    if [[ "$merged" == paused ]]; then
+      echo -e "\033[33m⏸ work kept on $(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null || echo "$wt"); this agent continues the task next time\033[0m"
+    elif [[ "$wid" != main ]]; then
       if [[ "$head" == "$base" ]] && ((conflict == 0)); then
         merged="nothing"
       elif integrate "$dir" "$wt" "$main" "$st"; then
@@ -418,14 +485,14 @@ cmd_loop() {
     esac
   done
   local dir; dir="$(project_dir "$name")"; check_ollama
+  rm -f "$RUN/$name/stop"
   ((jobs <= 1)) && { cmd_worker "$name" main "$iters"; return; }
   worker_alive "$name" main && die "a single-agent loop is running on $name"
-  rm -f "$RUN/$name/stop"
   local ids=() k=1
   while ((${#ids[@]} < jobs)); do worker_alive "$name" "w$k" || ids+=("w$k"); k=$((k + 1)); done
   # tmux starts panes with the tmux server's environment, so hand over this shell's overrides.
   local envs=() v
-  for v in AGENT_CLAUDE_BIN MAX_TURNS STUCK_LIMIT MAX_TASK_ATTEMPTS MAX_STEP_ATTEMPTS ITER_TIMEOUT NET; do
+  for v in BACKEND AGENT_CLAUDE_BIN MAX_TURNS STUCK_LIMIT MAX_TASK_ATTEMPTS MAX_STEP_ATTEMPTS ITER_TIMEOUT NET; do
     envs+=("$v=${!v:-}")
   done
   pane() { printf 'bash -c %q' "$(printf '%q ' env "${envs[@]}" "$ROOT/agent" worker "$name" "$1" "$iters"); echo; read -r -p '[agent exited — Enter closes this pane] '"; }
@@ -436,6 +503,9 @@ cmd_loop() {
     cmd_worker "$name" "${ids[0]}" "$iters"
   else
     local s="agent-$name"
+    if tmux has-session -t "=$s" 2>/dev/null; then   # left over from an earlier loop
+      if [[ -z "$(live_workers "$name")" ]]; then tmux kill-session -t "=$s"; else s="$s-$(date +%H%M%S)"; fi
+    fi
     tmux new-session -d -s "$s" -x 240 -y 70 "$(pane "${ids[0]}")"
     local id; for id in "${ids[@]:1}"; do tmux split-window -d -t "$s" "$(pane "$id")"; done
     tmux select-layout -t "$s" "$layout" >/dev/null
@@ -458,15 +528,27 @@ cmd_status() {
   done
 }
 
+descendants() { local c; for c in $(pgrep -P "$1"); do echo "$c"; descendants "$c"; done; }
+
 cmd_stop() {
   local name="${1:-}"; project_dir "$name" >/dev/null
   mkdir -p "$RUN/$name"; touch "$RUN/$name/stop"
+  local w pid
   if [[ "${2:-}" == --now ]]; then
-    local w pid; for w in $(live_workers "$name"); do
+    # Stop the claude runs only; each worker then writes a handoff, keeps the work on its branch and exits.
+    for w in $(live_workers "$name"); do
+      pid="$(<"$RUN/${w%%/*}/workers/${w#*/}.pid")"
+      local d; for d in $(descendants "$pid"); do
+        [[ "$(ps -o comm= -p "$d" 2>/dev/null)" == timeout ]] && kill -TERM "$d" 2>/dev/null
+      done
+    done
+    echo "interrupting $name's agents: each writes a 2-line handoff (a minute or two), then exits"
+  elif [[ "${2:-}" == --kill ]]; then
+    for w in $(live_workers "$name"); do
       pid="$(<"$RUN/${w%%/*}/workers/${w#*/}.pid")"
       kill -TERM -- "-$(ps -o pgid= -p "$pid" | tr -d ' ')" 2>/dev/null || kill -TERM "$pid"
     done
-    echo "stopped $name's agents"
+    echo "killed $name's agents (each writes its handoff when it starts again)"
   else
     echo "$name's agents stop after their current task (./agent status $name)"
   fi
@@ -487,5 +569,5 @@ case "$sub" in
   run)   cmd_run "$@" ;;
   shell) cmd_shell "$@" ;;
   list)  cmd_list ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

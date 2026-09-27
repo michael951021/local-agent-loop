@@ -5,6 +5,9 @@ Does what loop.md asks, instantly and without a model, driven by markers in the 
   [file PATH]   write the task's name as line 1 of PATH (two such tasks at once = merge conflict)
   [sleep N]     take N seconds (default 3), so agents overlap
   [fail]        do nothing, so the task is retried
+  [partial P]   write P before sleeping, so an interrupted run leaves work behind
+Resumed with the handoff prompt, it prints a 2-line note; a run that continues an interrupted task
+skips its sleep and records "resumed" in shared/seen.
 It checks the task's box, rewrites NOTES.md, appends to TASKLOG.md and commits, and prints a
 plausible stream-json transcript. Given the merge-conflict prompt, it merges and keeps both sides.
 """
@@ -32,6 +35,11 @@ def msg(n, text, tokens):
                                     "content": [{"type": "thinking", "thinking": "x" * 400}, {"type": "text", "text": text}]})
 
 
+if "--resume" in sys.argv and "Write a handoff" in prompt:
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result":
+                      "Done: partial file written, approach fake.\nNext: finish the task and check its box."}))
+    sys.exit(0)
+
 emit(type="system", subtype="init", model="fake")
 msg(1, "reading the task", 16000)
 
@@ -48,7 +56,14 @@ if m:
 else:
     m = re.search(r"## Your task \((\S+) line (\d+)\)\n(.+)", prompt)
     src, line, task = m.group(1), int(m.group(2)), m.group(3)
-    time.sleep(float((re.search(r"\[sleep ([\d.]+)\]", task) or [0, 3])[1]))
+    resumed = "## Continue an interrupted run" in prompt and "Next: finish the task" in prompt
+    part = re.search(r"\[partial (\S+)\]", task)
+    if part and not resumed:
+        open(part.group(1), "w").write("partial\n")
+    if resumed and os.path.isdir("shared"):
+        with open("shared/seen", "a") as s:
+            s.write(f"{os.environ.get('AGENT_WORKER')} resumed {task.split(':')[0]}\n")
+    time.sleep(0 if resumed else float((re.search(r"\[sleep ([\d.]+)\]", task) or [0, 3])[1]))
     if "[fail]" in task:
         note = "failed on purpose"
     else:
@@ -71,4 +86,4 @@ else:
         note = f"done: {name}"
 
 msg(2, note, 17000)
-emit(type="result", subtype="success", is_error=False, num_turns=2, duration_ms=1000)
+emit(duration_ms=1000, is_error=False, num_turns=2, subtype="success", type="result")   # Claude Code puts "type" late

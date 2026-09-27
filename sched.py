@@ -4,6 +4,11 @@
   sched.py next    STATE WORKER DIR [--ref REF]   claim the next task; prints JSON (exit codes below)
   sched.py release STATE WORKER                   drop WORKER's claim
   sched.py status  STATE DIR [--ref REF]          workers, claims and what each open task waits on
+  sched.py lastrun LOG                            the log's last run if it never ended (killed, crashed):
+                                                  JSON {task, src, parent, key, sid}; exit 1 if it ended
+
+An interrupted run leaves run/<project>/workers/WORKER.resume (its claim plus a short handoff from the
+killed session). WORKER's next `next` takes that task again first, with the handoff in the prompt.
 
 STATE is run/<project>/, DIR the directory holding the task files (the project, or a worktree).
 With --ref, task files are read from that git ref (the integration branch) instead of DIR.
@@ -159,7 +164,7 @@ def resolve(files, entry):
     return {"task": text, "src": src, "line": entry["line"], "parent": parent, "cl": cl, "next": None}
 
 
-def prompt(files, job, attempts, step_abandon, others):
+def prompt(files, job, attempts, step_abandon, others, resume=None):
     p = (ROOT / "prompts" / "loop.md").read_text().rstrip()
     p += f"\n\n## Your task ({job['src']} line {job['line']})\n{job['task']}"
     if job["cl"] and not job["parent"]:
@@ -176,7 +181,13 @@ def prompt(files, job, attempts, step_abandon, others):
     if others:
         p += ("\n\n## Other agents working in parallel (separate git worktrees; do not do their tasks, and "
               "avoid editing the files they will need)\n" + "\n".join(f"- {w}: {t}" for w, t in others))
-    if attempts > 1:
+    if resume:
+        p += ("\n\n## Continue an interrupted run\nA previous run on this task was stopped before it finished. "
+              "Its work is already committed on your branch (`git log`/`git diff` against the main branch show "
+              "it); it may be incomplete or untested. Its handoff note:\n"
+              + "\n".join(f"> {l}" for l in (resume.get("handoff") or "(none: the run could not write one)").splitlines())
+              + "\nCheck what is there, then finish the task.")
+    elif attempts > 1:
         p += (f"\n\nThis is attempt {attempts} at this task; earlier attempts did not finish it. Read NOTES.md "
               "for what was tried and why it failed, and try a different approach. Record this attempt's "
               "outcome in NOTES.md.")
@@ -197,8 +208,15 @@ def cmd_next(st, worker, d, ref):
         if not rows:
             return 10, {"reason": "no open tasks"}
         todo_open = [e["text"] for e, _, _ in rows]
+        rpath = st.d / "workers" / f"{worker}.resume"
+        resume = st.load(f"workers/{worker}.resume", None)
+        rpath.unlink(missing_ok=True)
+        if resume:   # the interrupted task goes first, if it is still open and nobody else took it
+            rows = sorted(rows, key=lambda r: r[0]["key"] != resume.get("key"))
+            if rows[0][0]["key"] != resume.get("key") or rows[0][1] not in ("ready", "waiting"):
+                resume = None
         for entry, state, why in rows:
-            if state != "ready":
+            if state != "ready" and not (resume and entry["key"] == resume["key"]):
                 continue
             job = resolve(files, entry)
             akey = key(job["src"] + "\0" + job["task"])
@@ -217,7 +235,9 @@ def cmd_next(st, worker, d, ref):
             others = [(c["worker"], c["task"]) for c in claims.values()]
             job.update(key=entry["key"], akey=akey, attempts=n, open=len(rows), unknown=entry["unknown"],
                        step_abandon=bool(job["parent"] and max_step and n > max_step),
-                       prompt=prompt(files, job, n, bool(job["parent"] and max_step and n > max_step), others))
+                       resumed=bool(resume and entry["key"] == resume["key"]),
+                       prompt=prompt(files, job, n, bool(job["parent"] and max_step and n > max_step), others,
+                                     resume if resume and entry["key"] == resume["key"] else None))
             st.save(f"workers/{worker}.json", {"worker": worker, "pid": int(os.environ.get("AGENT_PID") or os.getppid()), "key": entry["key"],
                                                "task": job["task"], "since": time.time()})
             return 0, job
@@ -226,6 +246,26 @@ def cmd_next(st, worker, d, ref):
             return 11, {"reason": "waiting", "open": len(rows),
                         "claimed": [(c["worker"], c["task"]) for c in claims.values()], "first_wait": waiting[:1]}
         return 12, {"reason": "blocked by given-up tasks", "failed": list(failed.values())}
+
+
+def cmd_lastrun(log):
+    """The last run in LOG if it has a harness start but no end (the worker was killed mid-run)."""
+    run, sid = None, None
+    try:
+        lines = open(log, errors="replace").read().splitlines()
+    except OSError:
+        return 1, {}
+    for line in lines:
+        if line.startswith('{"type":"harness"'):
+            ev = json.loads(line)
+            run, sid = (ev, None) if ev.get("event") == "start" else (None, None)
+        elif run and sid is None and '"subtype":"init"' in line:
+            sid = json.loads(line).get("session_id")
+    if not run:
+        return 1, {}
+    todo_line = run.get("parent") or run.get("task") or ""
+    return 0, {"task": run.get("task"), "src": run.get("src"), "parent": run.get("parent"),
+               "key": key(todo_line), "sid": sid, "rid": run.get("run")}
 
 
 def cmd_status(st, d, ref):
@@ -237,6 +277,9 @@ def cmd_status(st, d, ref):
         up = alive(c.get("pid"))
         mins = (time.time() - c.get("since", time.time())) / 60
         print(f"{c.get('worker', f.stem):6} {'running' if up else 'gone':8} {mins:5.0f} min  {c.get('task', '')[:100]}")
+    for f in sorted((st.d / "workers").glob("*.resume")):
+        r = st.load(f"workers/{f.name}", {})
+        print(f"{f.stem:6} {'paused':8}            {r.get('task', '')[:100]}\n{'':25}handoff: {(r.get('handoff') or '-')[:300]}")
     rows = plan(files, claims, failed)
     print(f"\n{len(rows)} open tasks")
     for entry, state, why in rows[:15]:
@@ -251,6 +294,10 @@ def main():
         i = a.index("--ref")
         ref = a[i + 1]
         del a[i:i + 2]
+    if a and a[0] == "lastrun":
+        code, out = cmd_lastrun(a[1])
+        print(json.dumps(out))
+        sys.exit(code)
     cmd, st = a[0], State(a[1])
     if cmd == "next":
         code, out = cmd_next(st, a[2], a[3], ref)

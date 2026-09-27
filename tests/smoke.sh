@@ -4,7 +4,8 @@
 #   KEEP=1 tests/smoke.sh   keep projects, logs and reports for a look
 # Checks: 2 agents on one project (claims, (after:) dependencies, worktrees, shared dir, merge
 # driver, a real merge conflict resolved by the agent), 1 agent in place (retries, giving up),
-# two single-agent loops on two projects at once, and that every run gets a report.
+# two single-agent loops on two projects at once, that every run gets a report, and that an
+# interrupted run (stop --now, or a hard kill) leaves a handoff and is continued by the same agent.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 A="$ROOT/agent"
@@ -16,7 +17,7 @@ bad()  { echo -e "  \033[31m✖\033[0m $*"; fails=$((fails + 1)); }
 check() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$what"; else bad "$what"; fi; }
 
 cleanup() {
-  tmux kill-session -t "agent-$P-par" 2>/dev/null
+  tmux kill-session -t "agent-$P-par" 2>/dev/null; tmux kill-session -t "agent-$P-int" 2>/dev/null
   for n in "$ROOT"/projects/$P-*; do
     [[ -d "$n" ]] || continue
     n="$(basename "$n")"
@@ -92,6 +93,36 @@ check "they overlapped in time" bash -c "grep -h '\"event\":\"start\"' '$ROOT'/l
 rm -f "$ROOT/run/$P-a.out" "$ROOT/run/$P-b.out"
 sleep 3
 check "reports for both projects" bash -c "[[ $(reports "$P-a") -ge 2 && $(reports "$P-b") -ge 2 ]]"
+
+echo "4. stop --now: handoff, work kept on the branch, the same agent continues"
+new "$P-int" '- [ ] S1: slow one [partial s1.part] [file s1.txt] [sleep 60] (after: -)
+- [ ] S2: slow two [partial s2.part] [file s2.txt] [sleep 60] (after: -)'
+d="$ROOT/projects/$P-int"; st="$ROOT/run/$P-int/workers"
+printf 'shared/\n' >> "$d/.gitignore"; printf 'shared\n' > "$d/.agent-shared"
+git -C "$d" add -A && git -C "$d" -c user.name=t -c user.email=t@t commit -qm "shared dir"
+env -u TMUX "$A" loop "$P-int" -j 2 </dev/null
+for _ in $(seq 30); do [[ -f "$st/w1.json" && -f "$st/w2.json" ]] && break; sleep 1; done; sleep 3
+"$A" stop "$P-int" --now >/dev/null
+wait_idle "$P-int" || bad "agents did not stop in time"
+check "both runs paused with a 2-line handoff" bash -c "jq -e '.handoff | test(\"^Done.*\\nNext:\")' '$st/w1.resume' '$st/w2.resume'"
+check "status shows the paused tasks" bash -c "'$A' status '$P-int' | grep -q paused"
+check "partial work on the agent branches, not merged" bash -c "git -C '$d' ls-tree -r --name-only agent/w1 | grep -q '\.part' && ! ls '$d'/*.part"
+check "the commit message carries the handoff" bash -c "git -C '$d' log -1 --format=%B agent/w1 | grep -q '^Next: finish'"
+t1="$(jq -r '.task' "$st/w1.resume" | cut -d: -f1)"; t2="$(jq -r '.task' "$st/w2.resume" | cut -d: -f1)"
+env -u TMUX "$A" loop "$P-int" -j 2 </dev/null
+sleep 2; wait_idle "$P-int" || bad "agents did not finish in time"
+check "each agent continued its own task" bash -c "grep -qx 'w1 resumed $t1' '$d/shared/seen' && grep -qx 'w2 resumed $t2' '$d/shared/seen'"
+check "both tasks done and merged, no resume files left" bash -c "! grep -q '^- \[ \]' '$d/TODO.md' && [[ -f '$d/s1.txt' && -f '$d/s2.txt' ]] && ! ls '$st'/*.resume"
+
+echo "5. hard kill (--kill): the handoff is written when the agent starts again"
+new "$P-kill" '- [ ] K: slow [partial k.part] [file k.txt] [sleep 60]'
+setsid "$A" loop "$P-kill" -j 1 </dev/null >/dev/null 2>&1 &
+for _ in $(seq 30); do [[ -f "$ROOT/run/$P-kill/workers/main.json" ]] && break; sleep 1; done; sleep 3
+"$A" stop "$P-kill" --kill >/dev/null; wait
+check "killed: no handoff yet" bash -c "[[ ! -f '$ROOT/run/$P-kill/workers/main.resume' ]]"
+out="$(timeout 50 "$A" loop "$P-kill" -j 1 </dev/null 2>&1)"
+check "restart wrote the handoff and continued K" bash -c "grep -q 'asking it for a handoff' <<<\"\$0\" && grep -q '^- \[x\] K' '$ROOT/projects/$P-kill/TODO.md'" "$out"
+check "the killed run got its end report" bash -c "[[ \$(ls '$ROOT/reports/$P-kill/'*-end.json 2>/dev/null | wc -l) -ge 2 ]]"
 
 [[ -n "${KEEP:-}" ]] || cleanup
 if ((fails)); then echo -e "\033[31m$fails check(s) failed\033[0m"; exit 1; fi
