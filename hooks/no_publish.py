@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""PreToolUse hook (Bash): block anything that publishes to GitHub.
+"""PreToolUse hook (Bash): block anything that publishes to GitHub, and direct calls to Ollama.
 
 Blocks git push, gh commands that create/edit/comment, and write requests through gh api or curl.
 Read-only gh/git/curl calls pass. Exit 2 blocks the call; stderr is shown to the agent.
 """
 import json
+import os
 import re
 import sys
 
@@ -50,6 +51,12 @@ def main() -> int:
     if data.get("tool_name") != "Bash":
         return 0
     cmd = (data.get("tool_input") or {}).get("command", "")
+    if os.environ.get("AGENT_BACKEND") == "llama" and re.search(r"(127\.0\.0\.1|localhost|0\.0\.0\.0):11434", cmd):
+        print("Blocked: 127.0.0.1:11434 is Ollama, which does not serve the model right now (llama-server does); "
+              "calling it loads a second copy of the model on the CPU. Use $OLLAMA_BASE_URL (OpenAI-compatible /v1) "
+              "or $OLLAMA_HOST (answers /api/tags) instead, e.g. curl \"$OLLAMA_BASE_URL/chat/completions\".",
+              file=sys.stderr)
+        return 2
     what = None
     for seg in segments(cmd):
         what = next((w for p, w in RULES if re.search(p, seg)), None)
