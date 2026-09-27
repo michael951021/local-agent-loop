@@ -100,6 +100,9 @@ sandbox() {
     --setenv CLAUDE_CODE_AUTO_COMPACT_WINDOW "$((NUM_CTX - CTX_MARGIN))"
     --setenv CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 1
     --setenv CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK 1   # pings only help streams
+    # A request queued behind other agents' requests gets no bytes until a slot frees up; allow for it
+    # (keepalive.py stops pinging at the same 30 min, so a stuck request still fails).
+    --setenv API_TIMEOUT_MS 1800000
     --setenv DISABLE_AUTOUPDATER 1
     --setenv GIT_AUTHOR_NAME agent --setenv GIT_AUTHOR_EMAIL agent@sandbox
     --setenv GIT_COMMITTER_NAME agent --setenv GIT_COMMITTER_EMAIL agent@sandbox
