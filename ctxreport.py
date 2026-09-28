@@ -256,11 +256,11 @@ def build(log, sid, trigger, run=None):
     by_phase = {}
     for e in ledger(t0 - 5, t1 + 5):
         if e.get("tag") == tag and "phase" in e and t0 - 5 <= e["t0"] <= t1 + 5:
-            a = by_phase.setdefault(e["phase"], {"calls": 0, "prompt": 0, "out": 0, "sec": 0.0})
-            a["calls"] += 1
-            a["prompt"] += prompt_tokens(e) + e.get("prompt_tokens", 0)
-            a["out"] += e.get("output_tokens", 0) + e.get("completion_tokens", 0)
-            a["sec"] += e.get("t1", e["t0"]) - e["t0"]
+            ph = by_phase.setdefault(e["phase"], {"calls": 0, "prompt": 0, "out": 0, "sec": 0.0})
+            ph["calls"] += 1
+            ph["prompt"] += prompt_tokens(e) + e.get("prompt_tokens", 0)
+            ph["out"] += e.get("output_tokens", 0) + e.get("completion_tokens", 0)
+            ph["sec"] += e.get("t1", e["t0"]) - e["t0"]
     phase_rows = [{"key": k, "name": phases.BY_KEY[k].name if k in phases.BY_KEY else k,
                    "why": phases.BY_KEY[k].separate if k in phases.BY_KEY else "", **v, "sec": round(v["sec"])}
                   for k, v in sorted(by_phase.items(), key=lambda kv: -kv[1]["sec"])]
