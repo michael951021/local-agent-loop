@@ -29,7 +29,7 @@ case "${1:-}" in
 Description=Agent run reports on the local network (loop harness)
 
 [Service]
-ExecStart=/usr/bin/python3 $ROOT/reportsrv.py --port $REPORTS_PORT
+ExecStart=$ROOT/.venv/bin/python3 $ROOT/reportsrv.py --port $REPORTS_PORT
 WorkingDirectory=$ROOT
 Restart=on-failure
 Nice=10

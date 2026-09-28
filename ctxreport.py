@@ -218,6 +218,27 @@ def timeline(all_reqs, runs, t0, t1, mine, prefix="../"):
     return [{"tag": t, **v} for t, v in sorted(by.items(), key=lambda kv: lane_order(kv[0], mine))]
 
 
+def plan_path(project, title, parent=None):
+    """Where a task sits in the current plan, for runs recorded before the path was (matched by title)."""
+    try:
+        from plan import Plan
+        from telemetry import split_title
+        text = (ROOT / "projects" / project / "TODO.md").read_text()
+    except (ImportError, OSError):
+        return []
+    plan = Plan.parse(text)
+    for i, line in enumerate(text.splitlines(), 1):
+        m = re.match(r"^\s*- \[.\] (.*)$", line)
+        if m and title and split_title(m.group(1))[0] == title:
+            return [s.model_dump() for s in plan.path(i)]
+    if parent:   # a checklist step: its milestone's place, then the step
+        head = plan_path(project, split_title(parent)[0])
+        if head:
+            return [dict(x, kind="milestone") if x["kind"] == "task" else x for x in head] + [
+                {"kind": "task", "title": title, "why": None}]
+    return []
+
+
 def build(log, sid, trigger, run=None):
     log = Path(log)
     start, end = (run or {}).get("start"), (run or {}).get("end")
@@ -313,7 +334,9 @@ def build(log, sid, trigger, run=None):
     begun = datetime.fromtimestamp(t0)
     data = {
         "title": task or f"session {sid[:8]}", "spec": spec,
-        "path": (start or {}).get("path") or [], "summary": (end or {}).get("summary"),
+        "path": (start or {}).get("path") or plan_path(project, title if start and start.get("task") else task,
+                                                            (start or {}).get("parent")),
+        "summary": (end or {}).get("summary"),
         "claimed": (end or {}).get("claimed"), "phases": phase_rows,
         "project": project, "worker": worker, "tag": tag, "sid": sid, "trigger": trigger, "log": log.name,
         "branch": (start or {}).get("branch"), "merged": (end or {}).get("merged"),
