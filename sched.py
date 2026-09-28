@@ -169,6 +169,24 @@ def plan(files, claims, failed):
     return out
 
 
+def where(files, job):
+    """The breadcrumb (goal → sections → task, each with its why) for a job, as plain dicts. A checklist
+    step gets the TODO.md path to its milestone, then the checklist's own sections."""
+    try:
+        from plan import Plan   # pydantic (harness .venv)
+    except ImportError:
+        return []
+    todo = Plan.parse(files.read("TODO.md"))
+    if not job["parent"]:
+        return [s.model_dump() for s in todo.path(job["line"])]
+    ms = next((ln for ln, _, t in tasks(files.read("TODO.md")) if t == job["parent"]), None)
+    head = [s.model_copy(update={"kind": "milestone"}) if s.kind == "task" else s for s in (todo.path(ms) if ms else [])]
+    steps = Plan.parse(files.read(job["src"])).path(job["line"])
+    steps = [s for s in steps if s.kind != "goal"]   # the checklist's title line is the milestone itself
+    return [s.model_dump() for s in head] + [dict(s.model_dump(), kind="section" if s.kind == "task" else s.kind)
+                                             for s in steps[:-1]] + [s.model_dump() for s in steps[-1:]]
+
+
 def resolve(files, entry):
     """Expand a milestone to its current checklist step."""
     text, src, parent = entry["text"], "TODO.md", None
@@ -184,6 +202,11 @@ def resolve(files, entry):
 
 def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
     p = (ROOT / "prompts" / "loop.md").read_text().rstrip()
+    if job.get("path"):
+        from plan import Step, render
+        p += ("\n\n## Where this fits\nEach level says how it serves the one above. Aim the work at your task's "
+              "why, not only at its checkbox; if the task as written would not serve it, say so in NOTES.md.\n"
+              + render([Step(**s) for s in job["path"]]))
     p += f"\n\n## Your task ({job['src']} line {job['line']})\n{job['task']}"
     if job["cl"] and not job["parent"]:
         p += (f"\n\nThis is a milestone line and {job['cl']} does not exist or has no open steps. Do what the "
@@ -199,6 +222,10 @@ def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
     if others:
         p += ("\n\n## Other agents working in parallel (separate git worktrees; do not do their tasks, and "
               "avoid editing the files they will need)\n" + "\n".join(f"- {w}: {t}" for w, t in others))
+    if ref:   # parallel agents: take in the others' work now, while this change is still in context
+        p += (f"\n\n## Before your final message\nAfter your commit, run `git merge {ref}` to take in what other "
+              "agents merged meanwhile. If it conflicts, resolve it so both sides' changes survive, re-run the "
+              "tests, and commit the merge. (Doing it now saves a separate merge-fix run later.)")
     if resume:
         p += ("\n\n## Continue an interrupted run\nA previous run on this task was stopped before it finished. "
               + (f"Its work is already committed on your branch (`git log {ref}..HEAD` and `git diff {ref}...HEAD` "
@@ -253,6 +280,7 @@ def cmd_next(st, worker, d, ref):
             attempts[akey] = n
             st.save("attempts.json", attempts)
             job["debrief"] = st.load("debriefs.json", {}).get(akey)
+            job["path"] = where(files, job)
             if job["next"] is None:
                 i = todo_open.index(entry["text"])
                 job["todo_next"] = todo_open[i + 1:i + 3]

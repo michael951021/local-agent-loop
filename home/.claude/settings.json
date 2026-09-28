@@ -29,6 +29,15 @@
             "command": "/opt/agent/hooks/task_done.py"
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/agent/hooks/plan_lint.py"
+          }
+        ]
       }
     ]
   },

@@ -20,12 +20,21 @@ and use `head`, `grep` or line ranges instead of whole large files.
    - Approach: how you did it
    - Blockers: any big blocker hit (looping/retrying, missing context, flaky tests, tooling gaps), or "none"
 6. git commit with a message describing the task.
-7. End the run with a one-line summary. Do not go on to another TODO line, even one that looks related or
-   unfinished: the harness hands out the next task, and other agents may already be working on it.
+7. End the run with this final message and nothing after it (the harness reads it; it is the only report of
+   how the run went, so make it true, not hopeful):
+   ```
+   RESULT: done | not done
+   SUMMARY: one line: what changed and how it works
+   WHY: not done only: the actual blocker
+   NEEDED: not done only: what would most have helped (a tool, access, data, context, or a smaller task)
+   ```
+   Do not go on to another TODO line, even one that looks related or unfinished: the harness hands out the
+   next task, and other agents may already be working on it.
 
 If the task is too large, replace its line (in the same file) with smaller `- [ ]` tasks, do the first one, and stop.
 Write every new task line as `- [ ] **Short title** — spec`: a 4-7 word title that makes sense on its own (reports
 show only the title), then what to build with the technical specifics, as briefly as they can be said.
+Under each new line add an indented `why:` line (at most 30 words): how that task serves its section's why.
 Put the old line's `(after: ...)` tag on the first new line and its `(id: ...)` tag on the last one.
 
 Other agents may be working on other tasks at the same time, each in its own git worktree; their tasks are

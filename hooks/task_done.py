@@ -26,7 +26,8 @@ def main() -> int:
         return 0
     clean = subprocess.run(["git", "-C", cwd, "status", "--porcelain"], capture_output=True, text=True).stdout.strip() == ""
     if clean:
-        print("Your task is checked off and everything is committed. End the run now with a one-line summary. "
+        print("Your task is checked off and everything is committed. End the run now with the final message "
+              "(RESULT: done / SUMMARY: ...). "
               "Do not start another TODO item: the harness assigns the next task (other agents own the others).",
               file=sys.stderr)
     else:

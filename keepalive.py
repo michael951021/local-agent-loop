@@ -26,11 +26,16 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import phases   # noqa: E402  (which model-call phase a request belongs to)
+
 IDLE = 20        # seconds of upstream silence before a ping
 MAX_AGE = 1800   # no pings for requests older than this
 PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 LEDGER = Path(__file__).resolve().parent / "logs" / "requests"
-USAGE = re.compile(rb'"(input_tokens|output_tokens|cache_read_input_tokens|cache_creation_input_tokens)":\s*(\d+)')
+USAGE = re.compile(rb'"(input_tokens|output_tokens|cache_read_input_tokens|cache_creation_input_tokens|'
+                   rb'prompt_tokens|completion_tokens)":\s*(\d+)')
+SAMPLED = {"side", "unknown", "pipeline", "debrief", "handoff", "compact"}   # bodies kept for inspection
 
 
 def log(msg):
@@ -82,6 +87,18 @@ def save_failed(body, entry):
         (d / f"{time.strftime('%Y%m%d-%H%M%S')}-{entry['status']}-{entry['tag'].replace('/', '_')}.json").write_bytes(body)
     except OSError as e:
         log(f"failed-request dump: {e!r}")
+
+
+def save_sample(body, entry):
+    """Keep the last 5 bodies of each rarely-seen phase in logs/requests/samples/ (to see what they are)."""
+    try:
+        d = LEDGER / "samples"
+        d.mkdir(parents=True, exist_ok=True)
+        for f in sorted(d.glob(f"{entry['phase']}-*.json"))[:-4]:
+            f.unlink()
+        (d / f"{entry['phase']}-{time.strftime('%Y%m%d-%H%M%S')}-{entry['tag'].replace('/', '_')}.json").write_bytes(body)
+    except OSError as e:
+        log(f"sample dump: {e!r}")
 
 
 async def relay_sse(up_r, headers, client_w, start, usage):
@@ -140,8 +157,15 @@ async def handle(client_r, client_w, upstream, tag, model=None):
             await client_w.drain()
             return
         start = time.monotonic()
-        if "/v1/messages" in first and "count_tokens" not in first:
-            entry = {"tag": tag, "t0": round(time.time(), 3), "path": first.split(" ")[1].split("?")[0]}
+        path = first.split(" ")[1].split("?")[0]
+        if ("/v1/messages" in path and "count_tokens" not in path) or path.endswith("/chat/completions"):
+            entry = {"tag": tag, "t0": round(time.time(), 3), "path": path}
+            try:
+                entry["phase"], entry["req"] = phases.classify(path, body)
+            except Exception as e:   # never cost us the request
+                entry["phase"], entry["req"] = "unknown", {"error": repr(e)}
+            if entry["phase"] in SAMPLED:
+                save_sample(body, entry)
         up_r, up_w = await asyncio.open_connection(*upstream)
         up_w.write(rewrite(first, lines, {"connection", "keep-alive"}) + body)
         await up_w.drain()
@@ -163,8 +187,12 @@ async def handle(client_r, client_w, upstream, tag, model=None):
             if pings:
                 log(f"{first} → {status.split(' ', 2)[1]} in {time.monotonic() - start:.0f}s, {pings} pings")
         else:
+            tail = b""
             while data := await up_r.read(65536):
                 client_w.write(data)
+                tail = (tail + data)[-4096:]   # usage sits at the end of a JSON response
+            if entry:
+                entry.update({k.decode(): int(v) for k, v in USAGE.findall(tail)})
         await client_w.drain()
     except (OSError, asyncio.IncompleteReadError, ValueError) as e:
         log(f"error: {e!r}")

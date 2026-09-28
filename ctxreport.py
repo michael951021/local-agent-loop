@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 import diffpage
+import phases
 import reportui
 from telemetry import (prompt_tokens, result, task_title, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
                        guess_task, harness_runs, ledger, log_runs, ollama_requests, read_session)
@@ -251,6 +252,18 @@ def build(log, sid, trigger, run=None):
                  "lanes": timeline(all_reqs, runs, t0, t1, tag)}
 
     gpu = gpu_samples(t0, t1)
+    # Every model call of this run by phase (keepalive.py tags them; runs from before that have none).
+    by_phase = {}
+    for e in ledger(t0 - 5, t1 + 5):
+        if e.get("tag") == tag and "phase" in e and t0 - 5 <= e["t0"] <= t1 + 5:
+            a = by_phase.setdefault(e["phase"], {"calls": 0, "prompt": 0, "out": 0, "sec": 0.0})
+            a["calls"] += 1
+            a["prompt"] += prompt_tokens(e) + e.get("prompt_tokens", 0)
+            a["out"] += e.get("output_tokens", 0) + e.get("completion_tokens", 0)
+            a["sec"] += e.get("t1", e["t0"]) - e["t0"]
+    phase_rows = [{"key": k, "name": phases.BY_KEY[k].name if k in phases.BY_KEY else k,
+                   "why": phases.BY_KEY[k].separate if k in phases.BY_KEY else "", **v, "sec": round(v["sec"])}
+                  for k, v in sorted(by_phase.items(), key=lambda kv: -kv[1]["sec"])]
     if start and start.get("task"):
         title, spec = task_title(start["task"], project)
         task = ("Merge fix: " if start.get("merge_fix") else "") + title
@@ -300,6 +313,8 @@ def build(log, sid, trigger, run=None):
     begun = datetime.fromtimestamp(t0)
     data = {
         "title": task or f"session {sid[:8]}", "spec": spec,
+        "path": (start or {}).get("path") or [], "summary": (end or {}).get("summary"),
+        "claimed": (end or {}).get("claimed"), "phases": phase_rows,
         "project": project, "worker": worker, "tag": tag, "sid": sid, "trigger": trigger, "log": log.name,
         "branch": (start or {}).get("branch"), "merged": (end or {}).get("merged"),
         # What became of the task, in plain words; the agent's own note when it did not finish.
@@ -350,13 +365,18 @@ def build(log, sid, trigger, run=None):
         data["diff"] = None
     (out_dir / f"{name}.html").write_text(reportui.page(data["title"][:80], data, TEMPLATE_JS))
     summary = {k: data[k] for k in ("title", "spec", "project", "worker", "tag", "start", "trigger", "merged", "result",
-                                    "note", "attempt", "diff")} | {
+                                    "note", "attempt", "diff", "path")} | {
         "run": (start or {}).get("run"), "share_pct": share and share["mine_pct"]} | {
         k: data["stats"][k] for k in ("wall_min", "turns", "peak_pct", "think_pct", "gen_tps", "util_avg", "outcome",
                                       "compactions", "retries")}
     (out_dir / f"{name}.json").write_text(json.dumps(summary))
     build_index()
     return out_dir / f"{name}.html"
+
+
+def crumb(s):
+    secs = [p["title"] for p in s.get("path") or [] if p.get("kind") in ("section", "milestone")]
+    return f'<div class="note" style="margin:0">{html.escape(" › ".join(secs))}</div>' if secs else ""
 
 
 def diff_cell(d, live=False, run=None, project=None):
@@ -409,7 +429,7 @@ def build_index():
                             f'{s["retries"]} retries' if s["retries"] else "") if x]
         rows.append(
             f'<tr><td class="num">{s["start"]}</td><td>{html.escape(who)}</td>'
-            f'<td><a href="{f.parent.name}/{f.stem}.html" title="{html.escape(s.get("spec") or "")}">{html.escape(short(s["title"], 90))}</a>{note}</td>'
+            f'<td>{crumb(s)}<a href="{f.parent.name}/{f.stem}.html" title="{html.escape(s.get("spec") or "")}">{html.escape(short(s["title"], 90))}</a>{note}</td>'
             f'<td>{tries}</td>'
             f'<td><span class="{r["cls"]}" title="{html.escape(r["why"])}"><b>{html.escape(r["label"])}</b></span>'
             f'<div class="note">{html.escape(r["why"])}{" · " + " · ".join(side) if side else ""}</div></td>'
@@ -479,7 +499,8 @@ const tot=Object.values(D.final).reduce((a,b)=>a+b,0)||1,gsum=Object.values(D.gr
 const pk=S.peak_pct,pkc=pk>=85?'bad':pk>=65?'warn':'';
 const who=D.worker&&D.worker!=='main'?`${esc(D.project)} / <b>${esc(D.worker)}</b>`:esc(D.project);
 const merge={yes:'merged',conflict:'<span class="warn">merge conflict</span>',parked:'<span class="bad">parked</span>',nothing:'no changes'}[D.merged]||'';
-let h=`<h1>${esc(D.title)}</h1>${D.spec&&D.spec!==D.title?`<div class="note" style="max-width:900px;margin:-4px 0 8px">${esc(D.spec)}</div>`:''}<div class="sub">${who} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
+const crumbs=(D.path||[]).filter(s=>s.kind!=='task');
+let h=(crumbs.length?`<div class="note" style="margin:0 0 4px">${crumbs.map(s=>`<span title="${esc(s.why||'')}">${esc(s.title)}</span>`).join(' › ')}</div>`:'')+`<h1>${esc(D.title)}</h1>${D.spec&&D.spec!==D.title?`<div class="note" style="max-width:900px;margin:-4px 0 8px">${esc(D.spec)}</div>`:''}<div class="sub">${who} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
 h+='<div class="tiles">'+[
  tile('Peak context',k(S.peak),`${pk}% of ${k(D.window)} window${S.real_peak?` · the server saw ${k(S.real_peak)}`:''}`,pkc),
  D.diff?tile('Changes',`<a href="../${esc(D.diff.path)}">${D.diff.files} file${D.diff.files==1?'':'s'}</a>`,`<span style="color:var(--c3)">+${D.diff.add}</span> <span class="bad">−${D.diff.del}</span> · <a href="../${esc(D.diff.path)}">view the diff</a>`):'',
@@ -493,6 +514,13 @@ h+='<div class="tiles">'+[
  tile('GPU util',S.util_avg!=null?S.util_avg+'%':'–','average, all GPUs'),
  tile('VRAM peak',S.vram_peak!=null?f1(S.vram_peak)+' GB':'–',`of ${S.vram_cap||'–'} GB · ${S.power_avg??'–'} W avg · ${S.energy_wh} Wh`),
 ].join('')+'</div>';
+if(D.path&&D.path.length)h+=card('Where this task fits','Each level says how it serves the one above (from TODO.md when the run started).',
+ '<table>'+D.path.map((s,i)=>`<tr><td style="padding-left:${8+i*14}px;white-space:nowrap"><b>${esc(s.title)}</b></td><td class="note">${esc(s.why||'no why given')}</td></tr>`).join('')+'</table>');
+if(D.summary||D.claimed)h+=card('The agent\'s final message',`It said: <b>${esc(D.claimed||'no RESULT line')}</b>`+(D.result&&D.claimed&&/not/i.test(D.claimed)!==/not/i.test(D.result.label)?' <span class="warn">(does not match the result)</span>':''),
+ `<div>${esc(D.summary||'')}</div>`);
+if(D.phases&&D.phases.length)h+=card('Model calls by phase','Every request this run sent to the model, grouped by why it was made (phases.py). Hover a row for why it is its own call.',
+ '<table><tr><th>Phase</th><th class="num">Calls</th><th class="num">Prompt tokens</th><th class="num">Tokens out</th><th class="num">GPU time</th></tr>'+
+ D.phases.map(p=>`<tr title="${esc(p.why)}"><td>${esc(p.name)}</td><td class="num">${p.calls}</td><td class="num">${k(p.prompt)}</td><td class="num">${k(p.out)}</td><td class="num">${mins(p.sec/60)}</td></tr>`).join('')+'</table>');
 if(D.note)h+=card(D.result&&D.result.label.includes('interrupted')?'Handoff from the agent':'Why it did not finish, in the agent\'s words',
  'Written by the agent itself right after the run (at most 2 lines).',`<div class="mono" style="white-space:pre-wrap">${esc(D.note)}</div>`);
 

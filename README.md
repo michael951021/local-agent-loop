@@ -102,6 +102,18 @@ private/loopback addresses and is read-only. With ufw on, allow the LAN once:
 | Serve | `reportsrv.py` (`./reportsrv`) | the folder on the LAN, live |
 | Trigger | `./agent` (end of run), `pretty.py` (compaction) | call the renderer; never block the agent |
 
+## Plan and model calls
+
+- **Plan tree** (`plan.py`, Pydantic): TODO.md is a goal, then sections, then tasks. Each section has a `> why:` line
+  and each task an indented `why:` line. The agent sees the chain above its task ("Where this fits"), and the reports
+  show it too. `hooks/plan_lint.py` tells the agent right away when a line it wrote has no why.
+  Run `.venv/bin/python plan.py tree|lint FILE` to print or check it.
+- **Model calls** (`phases.py`, [LLM_CALLS.md](LLM_CALLS.md)): every call the loop makes, when it happens, how many
+  times, and why it can't be folded into another. The proxy tags each request with its phase. A run's outcome comes
+  from the RESULT block in the agent's final message, and a separate debrief call is only a fallback.
+
+The harness's Python dependencies live in `.venv` (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`).
+
 ## What the sandbox allows
 
 | | Inside the sandbox |

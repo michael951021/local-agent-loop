@@ -15,6 +15,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# Harness Python deps (pydantic for plan.py) live in .venv; `./agent setup` creates it.
+[[ -x "$ROOT/.venv/bin/python3" ]] && export PATH="$ROOT/.venv/bin:$PATH"
 # shellcheck source=config.env
 source "$ROOT/config.env"
 # Optional secrets passed into the sandbox (GH_TOKEN=...). Not committed.
@@ -249,17 +251,11 @@ autocommit() {
 # A run that ends without a result (./agent stop --now, ITER_TIMEOUT, a crash) is paused, not merged:
 # its session is resumed once, without tools, to write a short handoff; its edits are committed on the
 # agent's branch; run/NAME/workers/ID.resume makes the same agent continue the task next time.
-HANDOFF_PROMPT="You are being stopped before this task is finished. Write a handoff for the agent that \
-will continue it: exactly 2 lines, at most 60 words in total, no preamble or formatting. \
-Line 1: what is done so far and how it works (files, approach). \
-Line 2: what is still needed to finish (next concrete steps, known problems)."
+HANDOFF_PROMPT="$(cat "$ROOT/prompts/handoff.md")"
 
-# A run that ends normally with its task still unchecked is asked why (shown in reports, and given to the
-# next attempt).
-DEBRIEF_PROMPT="You ended this run without finishing your task (its line is still unchecked). Answer in \
-exactly 2 short lines, at most 50 words in total, no preamble or formatting. \
-Line 1: why it was not finished (the actual blocker). \
-Line 2: what would most have helped (a tool, access, data, information, more context, or a smaller task)."
+# A run that ends normally with its task still unchecked and no RESULT block in its final message is
+# asked why (shown in reports, and given to the next attempt). See phases.py: this is a fallback.
+DEBRIEF_PROMPT="$(cat "$ROOT/prompts/debrief.md")"
 
 handoff() {   # DIR SID [PROMPT] → the note on stdout (empty if the session cannot be resumed)
   [[ -n "$2" && "$2" != null ]] || return 0
@@ -273,6 +269,10 @@ for l in lines:
     w = l.split()[:words]; words -= len(w)
     if w: out.append(" ".join(w))
 print("\n".join(out))' || true
+}
+
+final_field() {   # NAME TEXT → the value of "NAME: ..." in a final message's RESULT block
+  grep -ioP "^\W*$1\W*:\s*\K.*" <<<"$2" | tail -1 | sed 's/[*`]//g; s/^ *//; s/ *$//' || true
 }
 
 pause_task() {   # DIR STATE WID SID CLAIM_JSON → writes STATE/workers/WID.resume
@@ -441,6 +441,8 @@ cmd_worker() {
     echo -e "\n\033[1m━━ $name/$wid · iteration $i/$of · $(jq -r '.open // "?"' <<<"$j") open · attempt $(jq -r '.attempts // 1' <<<"$j")$fix ━━\033[0m"
     [[ -n "$(jq -r '.parent // empty' <<<"$j")" ]] && echo -e "\033[2m$(jq -r '.src + " ← " + .parent[:100]' <<<"$j")\033[0m"
     local ttl; ttl="$(jq -r '.title // empty' <<<"$j")"
+    local sec; sec="$(jq -r '[.path[]? | select(.kind == "section") | .title] | join(" › ")' <<<"$j")"
+    [[ -n "$sec" ]] && echo -e "\033[2m$sec ›\033[0m"
     if [[ -n "$ttl" && "$ttl" != "$task" ]]; then echo -e "\033[1m$ttl\033[0m \033[2m— ${task#*— }\033[0m"; else echo -e "\033[2m$task\033[0m"; fi
 
     local rid base n0; rid="$(date +%s)-$wid-$RANDOM"; base="$(git -C "$wt" rev-parse HEAD)"
@@ -449,16 +451,17 @@ cmd_worker() {
       --arg br "$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null)" --argjson c "$conflict" \
       --argjson n "$(live_workers "$name" | wc -l)" --argjson np "$NUM_PARALLEL" --argjson ctx "$NUM_CTX" \
       '{project: $p, worker: $w, workdir: $d, base: $b, branch: $br, agents: $n, num_parallel: $np, num_ctx: $ctx,
-        task: .task, src: .src, parent: .parent, attempts: .attempts, merge_fix: ($c > 0), resumed: (.resumed // false)}' <<<"$j")"
+        task: .task, src: .src, parent: .parent, path: (.path // []), attempts: .attempts, merge_fix: ($c > 0), resumed: (.resumed // false)}' <<<"$j")"
     # hooks/task_done.py tells the agent to stop once this line is checked (merge-fix runs have no task).
     local src; src="$(jq -r '.src // "TODO.md"' <<<"$j")"
     SB_ENV=(); ((conflict)) || SB_ENV=(--setenv AGENT_TASK "$task" --setenv AGENT_TASK_SRC "$src")
     headless "$wt" "$prompt" "$log" "$rid" || echo "(run exited non-zero)"
     SB_ENV=()
-    local head merged="n/a" checked=0 was_fix=$conflict sid session state=open note=""
+    local head merged="n/a" checked=0 was_fix=$conflict sid session state=open note="" final=""
     sid="$(tail -n "+$((n0 + 1))" "$log" | grep -m1 '"subtype":"init"' | jq -r .session_id || true)"
     session="$(tail -n "+$((n0 + 1))" "$log" | grep '"type":"result"' | tail -1 |   # key order varies
       jq -r 'if .is_error then (if .subtype == "success" then "error" else .subtype end) else .subtype end' 2>/dev/null || true)"
+    final="$(tail -n "+$((n0 + 1))" "$log" | grep '"type":"result"' | tail -1 | jq -r '.result // empty' 2>/dev/null || true)"
     grep -qiF -- "- [x] $task" "$wt/$src" 2>/dev/null && checked=1
     # What became of the task: done, split (its line replaced by smaller ones), or still open.
     if ((was_fix)); then state="merge-fix"
@@ -471,8 +474,18 @@ cmd_worker() {
       pause_task "$wt" "$st" "$wid" "$sid" "$(cat "$st/workers/$wid.json" 2>/dev/null || echo '{}')"
       merged="paused"; state="interrupted"; note="$(jq -r '.handoff // ""' "$st/workers/$wid.resume" 2>/dev/null)"
     elif [[ "$state" == open ]]; then
-      echo -e "\033[33m✖ task not finished — asking the agent why\033[0m"
-      note="$(handoff "$wt" "$sid" "$DEBRIEF_PROMPT")"
+      # The agent's own account is in its final message (RESULT block, prompts/loop.md step 7); only
+      # without one is the session resumed to ask (an extra model call, see phases.py).
+      note="$(final_field WHY "$final")"$'\n'"$(final_field NEEDED "$final")"; note="${note#$'\n'}"; note="${note%$'\n'}"
+      if [[ -z "$note" && -n "$(final_field RESULT "$final")" ]]; then
+        note="Said \"$(final_field RESULT "$final")\" but its line is unchecked. $(final_field SUMMARY "$final")"
+      fi
+      if [[ -n "$note" ]]; then
+        echo -e "\033[33m✖ task not finished\033[0m"
+      else
+        echo -e "\033[33m✖ task not finished, no RESULT block — asking the agent why\033[0m"
+        note="$(handoff "$wt" "$sid" "$DEBRIEF_PROMPT")"
+      fi
       # A session that died on an error (e.g. a failed compaction) often cannot be resumed: keep the error.
       [[ -n "$note" ]] || note="$(tail -n "+$((n0 + 1))" "$log" | grep '"type":"result"' | tail -1 |
         jq -r 'select(.is_error) | "Session error: " + (.result // "unknown")' 2>/dev/null | cut -c1-300 || true)"
@@ -501,7 +514,8 @@ cmd_worker() {
     fi
     ((conflict)) || python3 "$ROOT/sched.py" release "$st" "$wid"
     run_end "$log" "$rid" "$(jq -n --arg h "$head" --arg m "$merged" --arg ts "$state" --arg s "${session:-cut off}" \
-      --arg n "$note" '{head: $h, merged: $m, task_state: $ts, session: $s, note: $n}')"
+      --arg n "$note" --arg sm "$(final_field SUMMARY "$final")" --arg rc "$(final_field RESULT "$final")" \
+      '{head: $h, merged: $m, task_state: $ts, session: $s, note: $n, summary: $sm, claimed: $rc}')"
     if [[ "$head" == "$base" ]]; then
       stuck=$((stuck + 1))
       echo "no changes this iteration ($stuck/${STUCK_LIMIT/#0/∞})"
