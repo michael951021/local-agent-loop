@@ -193,9 +193,13 @@ def resolve(files, entry):
     m = CHECKLIST.search(text)
     cl = m.group(1) if m else None
     if cl:
-        steps = [(ln, t) for ln, done, t in tasks(files.read(cl)) if not done]
+        body = files.read(cl)
+        steps = [(ln, t) for ln, done, t in tasks(body) if not done]
         if steps:
-            return {"task": steps[0][1], "src": cl, "line": steps[0][0], "parent": text, "cl": cl,
+            # the checklist's `# ` title names its instance (repo, issue): templates reuse step texts,
+            # so retry counts and debriefs must not carry over from one issue's checklist to the next
+            inst = next((ln[2:].strip() for ln in body.splitlines() if ln.startswith("# ")), "")
+            return {"task": steps[0][1], "src": cl, "inst": inst, "line": steps[0][0], "parent": text, "cl": cl,
                     "next": [t for _, t in steps[1:3]]}
     return {"task": text, "src": src, "line": entry["line"], "parent": parent, "cl": cl, "next": None}
 
@@ -269,7 +273,7 @@ def cmd_next(st, worker, d, ref):
             if state != "ready" and not (resume and entry["key"] == resume["key"]):
                 continue
             job = resolve(files, entry)
-            akey = key(job["src"] + "\0" + job["task"])
+            akey = key(job["src"] + "\0" + job.get("inst", "") + "\0" + job["task"])
             n = attempts.get(akey, 0) + 1
             give_up = (max_task and n > max_task) or (job["parent"] and max_step and n > max_step + 2)
             if give_up:
