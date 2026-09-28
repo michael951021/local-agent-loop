@@ -27,7 +27,7 @@ from pathlib import Path
 import diffpage
 import phases
 import reportui
-from telemetry import (prompt_tokens, result, task_title, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
+from telemetry import (closed_levels, prompt_tokens, result, task_title, LOGS, ROOT, agent_tag, attribute, clean_task, commits, config, fair_share, gpu_samples,
                        guess_task, harness_runs, ledger, log_runs, ollama_requests, read_session)
 
 REPORTS = ROOT / "reports"
@@ -332,16 +332,17 @@ def build(log, sid, trigger, run=None):
     energy_wh = sum(power) * 5 / 3600 if power else 0
 
     begun = datetime.fromtimestamp(t0)
+    path = (start or {}).get("path") or plan_path(project, title if start and start.get("task") else task,
+                                                   (start or {}).get("parent"))
     data = {
         "title": task or f"session {sid[:8]}", "spec": spec,
-        "path": (start or {}).get("path") or plan_path(project, title if start and start.get("task") else task,
-                                                            (start or {}).get("parent")),
+        "path": path, "closed": (cl := closed(start, end, path)),
         "summary": (end or {}).get("summary"),
         "claimed": (end or {}).get("claimed"), "phases": phase_rows,
         "project": project, "worker": worker, "tag": tag, "sid": sid, "trigger": trigger, "log": log.name,
         "branch": (start or {}).get("branch"), "merged": (end or {}).get("merged"),
         # What became of the task, in plain words; the agent's own note when it did not finish.
-        "result": dict(zip(("label", "cls", "why"), result(start, end))) if start else None,
+        "result": fix_archived(dict(zip(("label", "cls", "why"), result(start, end))), cl) if start else None,
         "note": (end or {}).get("note") or (f"Session error: {res.get('result')}" if res and res.get("is_error") and res.get("result") else None),
         "attempt": {"n": (start or {}).get("attempts"), "resumed": bool((start or {}).get("resumed")),
                     "merge_fix": bool((start or {}).get("merge_fix"))},
@@ -388,7 +389,7 @@ def build(log, sid, trigger, run=None):
         data["diff"] = None
     (out_dir / f"{name}.html").write_text(reportui.page(data["title"][:80], data, TEMPLATE_JS))
     summary = {k: data[k] for k in ("title", "spec", "project", "worker", "tag", "start", "trigger", "merged", "result",
-                                    "note", "attempt", "diff", "path")} | {
+                                    "note", "attempt", "diff", "path", "closed")} | {
         "run": (start or {}).get("run"), "share_pct": share and share["mine_pct"]} | {
         k: data["stats"][k] for k in ("wall_min", "turns", "peak_pct", "think_pct", "gen_tps", "util_avg", "outcome",
                                       "compactions", "retries")}
@@ -397,9 +398,43 @@ def build(log, sid, trigger, run=None):
     return out_dir / f"{name}.html"
 
 
+def closed(start, end, path):
+    """The plan levels this run finished, without its own line (the Result column says that)."""
+    if not start or not end:
+        return []
+    own = (path or [{}])[-1].get("title")
+    try:
+        return [c for c in closed_levels(start, end, path or []) if not (c["kind"] == "milestone" and c["title"] == own)]
+    except Exception as e:   # never cost us the report
+        print(f"closed levels: {e!r}", file=sys.stderr)
+        return []
+
+
+def fix_archived(res, closed_levels):
+    """A checklist's last step archives the file it was checked in, so the harness cannot find the line and
+    reports "split"; a run that finished its whole checklist did its step."""
+    if res and res["label"].startswith("✂") and any(c["kind"] == "checklist" for c in closed_levels or []):
+        return {"label": "✔ done", "cls": "good", "why": "last step: checklist finished and archived"}
+    return res
+
+
 def crumb(s):
+    """The task's place in the plan; the levels this run finished are ticked."""
+    done = {c["title"] for c in s.get("closed") or []}
     secs = [p["title"] for p in s.get("path") or [] if p.get("kind") in ("section", "milestone")]
-    return f'<div class="note" style="margin:0">{html.escape(" › ".join(secs))}</div>' if secs else ""
+    if not secs:
+        return ""
+    return '<div class="note" style="margin:0">' + " › ".join(
+        f'<b style="color:var(--c3)">✓ {html.escape(t)}</b>' if t in done else html.escape(t) for t in secs) + "</div>"
+
+
+def finished_line(s):
+    c = s.get("closed") or []
+    if not c:
+        return ""
+    names = {"checklist": "checklist", "milestone": "milestone", "section": "section", "goal": "goal"}
+    return ('<div class="note" style="margin:2px 0 0;color:var(--c3)">✓ finished ' +
+            ", ".join(f'{names.get(x["kind"], x["kind"])} <b>{html.escape(short(x["title"], 60))}</b>' for x in c) + "</div>")
 
 
 def dur(m):
@@ -445,6 +480,14 @@ def build_index():
             f'<div class="note">for {(time.time() - st["t"]) / 60:.0f} min; report when it ends</div></td>'
             f'<td class="num">{so_far}</td>'
             f'<td class="num">{dur((time.time() - st["t"]) / 60)}</td>' + '<td class="num">–</td>' * 5 + '</tr>')
+    missing = [(f, s) for f, s in runs.values() if "closed" not in s and s.get("run")]
+    if missing:   # reports from before the field: work it out once from the harness lines, keep it in the JSON
+        hr = {r["start"]["run"]: r for r in harness_runs(0)}
+        for f, s in missing:
+            r = hr.get(s["run"])
+            s["closed"] = closed(r["start"], r["end"], s.get("path")) if r else []
+            s["result"] = fix_archived(s.get("result"), s["closed"])
+            f.write_text(json.dumps(s))
     for k, (f, s) in sorted(runs.items(), key=lambda kv: (kv[1][1]["start"], kv[1][0].name), reverse=True):
         who = s.get("tag") or s["project"]
         r = s.get("result") or {"label": s["outcome"], "cls": "", "why": ""}
@@ -457,7 +500,7 @@ def build_index():
                             f'{s["retries"]} retries' if s["retries"] else "") if x]
         rows.append(
             f'<tr><td class="num">{s["start"]}</td><td>{html.escape(who)}</td>'
-            f'<td>{crumb(s)}<a href="{f.parent.name}/{f.stem}.html" title="{html.escape(s.get("spec") or "")}">{html.escape(short(s["title"], 90))}</a>{note}</td>'
+            f'<td>{crumb(s)}<a href="{f.parent.name}/{f.stem}.html" title="{html.escape(s.get("spec") or "")}">{html.escape(short(s["title"], 90))}</a>{finished_line(s)}{note}</td>'
             f'<td>{tries}</td>'
             f'<td><span class="{r["cls"]}" title="{html.escape(r["why"])}"><b>{html.escape(r["label"])}</b></span>'
             f'<div class="note">{html.escape(r["why"])}{" · " + " · ".join(side) if side else ""}</div></td>'
@@ -543,8 +586,10 @@ h+='<div class="tiles">'+[
  tile('GPU util',S.util_avg!=null?S.util_avg+'%':'–','average, all GPUs'),
  tile('VRAM peak',S.vram_peak!=null?f1(S.vram_peak)+' GB':'–',`of ${S.vram_cap||'–'} GB · ${S.power_avg??'–'} W avg · ${S.energy_wh} Wh`),
 ].join('')+'</div>';
-if(D.path&&D.path.length)h+=card('Where this task fits','Each level says how it serves the one above (from TODO.md when the run started).',
- '<table>'+D.path.map((s,i)=>`<tr><td style="padding-left:${8+i*14}px;white-space:nowrap"><b>${esc(s.title)}</b></td><td class="note">${esc(s.why||'no why given')}</td></tr>`).join('')+'</table>');
+const CL=new Set((D.closed||[]).map(c=>c.title));
+if(D.path&&D.path.length)h+=card('Where this task fits','Each level says how it serves the one above (from TODO.md when the run started). <b style="color:var(--c3)">✓</b> = this run finished that level: its last open task was done here.',
+ '<table>'+D.path.map((s,i)=>`<tr><td style="padding-left:${8+i*14}px;white-space:nowrap">${CL.has(s.title)?'<b style="color:var(--c3)">✓ </b>':''}<b>${esc(s.title)}</b></td><td class="note">${esc(s.why||'no why given')}</td></tr>`).join('')+'</table>'+
+ ((D.closed||[]).length?`<div class="note" style="color:var(--c3)">Finished by this run: ${D.closed.map(c=>`${esc(c.kind)} <b>${esc(c.title)}</b>`).join(' → ')}</div>`:''));
 if(D.summary||D.claimed)h+=card('The agent\'s final message',`It said: <b>${esc(D.claimed||'no RESULT line')}</b>`+(D.result&&D.claimed&&/not/i.test(D.claimed)!==/not/i.test(D.result.label)?' <span class="warn">(does not match the result)</span>':''),
  `<div>${esc(D.summary||'')}</div>`);
 if(D.phases&&D.phases.length)h+=card('Model calls by phase','Every request this run sent to the model, grouped by why it was made (phases.py). Hover a row for why it is its own call.',

@@ -360,6 +360,74 @@ def gpu_samples(t0, t1, step=None):
 
 # ── git ───────────────────────────────────────────────────────────────────────
 
+def _show(pdir, rev, path):
+    r = subprocess.run(["git", "-C", str(pdir), "show", f"{rev}:{path}"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def _closed(before, after, checklist=False):
+    """Plan levels open in `before` and finished in `after`, deepest first: sections whose tasks are all
+    checked now (matched by their chain of headings), and milestone lines that got checked."""
+    def index(plan):
+        out = {}
+        def go(sec, trail):
+            key = trail + (sec.title,)
+            out[key] = sec
+            for c in sec.children:
+                go(c, key)
+        go(plan.root, ())
+        return out
+    b, a = index(before), index(after)
+    out = []
+    for key, sec in b.items():
+        new = a.get(key)
+        if new is None or not sec.has_open() or new.has_open():
+            continue
+        kind = ("checklist" if checklist else "goal") if len(key) == 1 else "section"
+        out.append({"kind": kind, "title": sec.title, "depth": len(key)})
+    if not checklist:
+        done_after = {t.text for s in after.root.walk() for t in s.tasks if t.done}
+        for s in before.root.walk():
+            for t in s.tasks:
+                if not t.done and "(checklist:" in t.text and t.text in done_after:
+                    out.append({"kind": "milestone", "title": t.title, "depth": 99})
+    return sorted(out, key=lambda x: -x["depth"])
+
+
+def closed_levels(start, end, path=None):
+    """What this run finished in the plan besides its own line: the checklist sections, checklist, TODO.md
+    sections and milestones that had open tasks at the run's base commit and none at its head.
+    Deepest first. [] when unknown (no commits, no pydantic). TODO.md levels count only when they are on
+    this task's own path (base..head also holds what other agents merged meanwhile)."""
+    try:
+        from plan import Plan
+    except ImportError:
+        return []
+    start, end = start or {}, end or {}
+    pdir = ROOT / "projects" / (start.get("project") or "")
+    base, head = start.get("base"), end.get("head")
+    if not (base and head and base != head and (pdir / ".git").exists()):
+        return []
+    out = []
+    src = start.get("src")
+    if src and src not in ("TODO.md", "None"):
+        before, after = _show(pdir, base, src), _show(pdir, head, src)
+        if before and after is None:   # finished or abandoned: the checklist was archived under state/checklists/
+            moved = subprocess.run(["git", "-C", str(pdir), "diff", "--name-only", "--diff-filter=A", base, head,
+                                    "--", "state/checklists/"], capture_output=True, text=True).stdout.split()
+            title = before.splitlines()[0] if before else ""
+            after = next((t for t in (_show(pdir, head, m) for m in moved) if t and t.splitlines()[0] == title), None)
+        if before and after:
+            out += _closed(Plan.parse(before), Plan.parse(after), checklist=True)
+    before, after = _show(pdir, base, "TODO.md"), _show(pdir, head, "TODO.md")
+    on_path = {p["title"] for p in (path if path is not None else start.get("path") or [])}
+    if before and after:
+        out += [x for x in _closed(Plan.parse(before), Plan.parse(after)) if x["title"] in on_path]
+    for x in out:
+        x.pop("depth", None)
+    return out
+
+
 def commits(project, base, head):
     pdir = ROOT / "projects" / project
     if not (base and head and (pdir / ".git").exists()) or base == head:
