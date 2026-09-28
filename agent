@@ -29,7 +29,7 @@ PROJECTS="$ROOT/projects"
 LOGS="$ROOT/logs"
 RUN="$ROOT/run"
 CLAUDE_BIN="$(readlink -f "${AGENT_CLAUDE_BIN:-$(command -v claude)}")"   # AGENT_CLAUDE_BIN: tests use a fake
-# BACKEND=ollama: Ollama serves MODEL. BACKEND=llama: ./llamasrv runs the same GGUF on llama-server,
+# BACKEND=ollama: Ollama serves MODEL. BACKEND=llama: bin/llamasrv runs the same GGUF on llama-server,
 # which gives NUM_PARALLEL real slots (Ollama runs qwen35 models one request at a time).
 : "${BACKEND:=ollama}" "${LLAMA_URL:=http://127.0.0.1:11500}"
 API_URL="$OLLAMA_URL"; [[ "$BACKEND" == llama ]] && API_URL="$LLAMA_URL"
@@ -46,10 +46,10 @@ project_dir() {
 
 check_ollama() {
   if [[ "$BACKEND" == llama ]]; then
-    curl -sf "$LLAMA_URL/health" >/dev/null || "$ROOT/llamasrv" start >&2 || die "llama-server did not start (./llamasrv logs)"
+    curl -sf "$LLAMA_URL/health" >/dev/null || "$ROOT/bin/llamasrv" start >&2 || die "llama-server did not start (bin/llamasrv logs)"
     return 0
   fi
-  ! systemctl --user is-active -q llama-agent 2>/dev/null || die "BACKEND=ollama but llama-server holds the GPUs (./llamasrv stop)"
+  ! systemctl --user is-active -q llama-agent 2>/dev/null || die "BACKEND=ollama but llama-server holds the GPUs (bin/llamasrv stop)"
   curl -sf "$OLLAMA_URL/api/version" >/dev/null || die "Ollama not reachable at $OLLAMA_URL"
   ollama list | awk '{print $1}' | grep -qx "$MODEL:latest" || die "model '$MODEL' missing — run: ./agent setup"
 }
@@ -67,7 +67,7 @@ sandbox() {
   mkdir -p "$RUN" "$LOGS"
   local kafile ka_pid ka_port status=0
   kafile="$(mktemp "$RUN/keepalive.XXXXXX")"
-  python3 "$ROOT/keepalive.py" 0 "127.0.0.1:$API_PORT" --tag "${SB_TAG:-$(basename "$proj")}" \
+  python3 "$ROOT/lib/keepalive.py" 0 "127.0.0.1:$API_PORT" --tag "${SB_TAG:-$(basename "$proj")}" \
     $([[ "$BACKEND" == llama ]] && echo "--ollama-shim $MODEL") \
     > "$kafile" 2>>"$LOGS/keepalive.log" &
   ka_pid=$!
@@ -88,7 +88,7 @@ sandbox() {
     --ro-bind "$CLAUDE_BIN" /opt/claude/claude
     --ro-bind "$ROOT/prompts" /opt/agent/prompts
     --ro-bind "$ROOT/hooks" /opt/agent/hooks
-    --ro-bind "$ROOT/bridge.py" /opt/agent/bridge.py
+    --ro-bind "$ROOT/lib/bridge.py" /opt/agent/bridge.py
     --ro-bind "$ROOT/mcp" /opt/agent/mcp
     --bind "$proj" /work
     --chdir /work
@@ -145,7 +145,7 @@ sandbox() {
     # No network namespace access: tunnel only Ollama through a unix socket.
     mkdir -p "$RUN"
     local sock="$RUN/ollama.$$.sock"
-    python3 "$ROOT/bridge.py" out "$sock" "127.0.0.1:$ka_port" &
+    python3 "$ROOT/lib/bridge.py" out "$sock" "127.0.0.1:$ka_port" &
     local bridge_pid=$!
     for _ in {1..50}; do [[ -S "$sock" ]] && break; sleep 0.1; done
     args+=(--bind "$sock" /run/ollama.sock)
@@ -168,7 +168,7 @@ cmd_setup() {
   ollama create "$MODEL" -f "$RUN/Modelfile"
   echo "ready: $MODEL ($BASE_MODEL, ctx $NUM_CTX per request)"
   if [[ "$BACKEND" == llama ]]; then
-    echo "BACKEND=llama: ./llamasrv serves $NUM_PARALLEL slots x $NUM_CTX from this model's GGUF (no root needed)"
+    echo "BACKEND=llama: bin/llamasrv serves $NUM_PARALLEL slots x $NUM_CTX from this model's GGUF (no root needed)"
     return 0
   fi
   # With Ollama, NUM_PARALLEL is a server setting (one KV cache of NUM_CTX per slot) that lives in systemd.
@@ -214,7 +214,7 @@ headless() {
   local dir="$1" prompt="$2" log="$3" rid="${4:-}"
   sandbox "$dir" -- timeout --kill-after=60 "$ITER_TIMEOUT" claude -p "$prompt" "${claude_args[@]}" \
     --max-turns "$MAX_TURNS" --output-format stream-json --verbose \
-    < /dev/null | tee -a "$log" | AGENT_RUN="$rid" python3 "$ROOT/pretty.py"
+    < /dev/null | tee -a "$log" | AGENT_RUN="$rid" python3 "$ROOT/lib/pretty.py"
 }
 
 # Every run is framed by two {"type":"harness"} lines in its log (who ran what, where, and how it
@@ -225,7 +225,7 @@ run_begin() {
 run_end() {
   jq -c --arg run "$2" '{type: "harness", event: "end", run: $run, t: now} + .' <<<"$3" >> "$1"
   # End-of-run report, detached so it never delays the next task.
-  setsid python3 "$ROOT/ctxreport.py" "$1" --run "$2" --trigger end </dev/null >>"$LOGS/ctxreport.log" 2>&1 &
+  setsid python3 "$ROOT/lib/ctxreport.py" "$1" --run "$2" --trigger end </dev/null >>"$LOGS/ctxreport.log" 2>&1 &
 }
 
 cmd_run() {
@@ -304,7 +304,7 @@ live_workers() {   # live_workers [NAME] → "name/id" lines
 setup_parallel_repo() {
   local dir="$1" attrs
   git -C "$dir" config merge.agentlines.name "agent line merge"
-  git -C "$dir" config merge.agentlines.driver "python3 $ROOT/mergelines.py %O %A %B"
+  git -C "$dir" config merge.agentlines.driver "python3 $ROOT/lib/mergelines.py %O %A %B"
   attrs="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir)/info/attributes"
   mkdir -p "$(dirname "$attrs")"
   local f; for f in TODO.md NOTES.md TASKLOG.md; do
@@ -381,7 +381,7 @@ cmd_worker() {
     # Agents start together; git config and worktree creation take a lock, so do them one at a time.
     ( flock 9; setup_parallel_repo "$dir"; ensure_worktree "$dir" "$wt" "agent/$wid" "$main" ) 9>"$st/merge.lock"
     # git inside the sandbox needs the shared .git and the merge driver at their host paths.
-    SB_BINDS+=(--bind "$dir/.git" "$dir/.git" --ro-bind "$ROOT/mergelines.py" "$ROOT/mergelines.py")
+    SB_BINDS+=(--bind "$dir/.git" "$dir/.git" --ro-bind "$ROOT/lib/mergelines.py" "$ROOT/lib/mergelines.py")
     # Gitignored runtime data every agent shares with the main checkout (venvs, clones, databases).
     local p; while read -r p; do
       [[ -z "$p" || "$p" == \#* ]] && continue
@@ -392,11 +392,11 @@ cmd_worker() {
     rm -f "$dir/DONE"
   fi
   SB_TAG="$tag"
-  trap "python3 '$ROOT/sched.py' release '$st' '$wid'; rm -f '$st/workers/$wid.pid'" EXIT   # expanded now: locals are gone at exit
+  trap "python3 '$ROOT/lib/sched.py' release '$st' '$wid'; rm -f '$st/workers/$wid.pid'" EXIT   # expanded now: locals are gone at exit
   if [[ ! -f "$st/workers/$wid.resume" ]]; then   # was this agent's last run killed before it ended?
     local prev lr pat="$LOGS/$name-$wid-2*.jsonl"; [[ "$wid" == main ]] && pat="$LOGS/$name-2*.jsonl"
     prev="$(ls -t $pat 2>/dev/null | head -1 || true)"
-    if [[ -n "$prev" ]] && lr="$(python3 "$ROOT/sched.py" lastrun "$prev")"; then
+    if [[ -n "$prev" ]] && lr="$(python3 "$ROOT/lib/sched.py" lastrun "$prev")"; then
       pause_task "$wt" "$st" "$wid" "$(jq -r .sid <<<"$lr")" "$lr"
       run_end "$prev" "$(jq -r .rid <<<"$lr")" "$(jq -n --arg n "$(jq -r '.handoff // ""' "$st/workers/$wid.resume")" \
         '{merged: "paused", task_state: "interrupted", session: "cut off", note: $n}')"
@@ -422,7 +422,7 @@ cmd_worker() {
     if ((conflict)); then
       prompt="$(conflict_prompt "$main" "${task:-(earlier task)}")"
     else
-      rc=0; job="$(python3 "$ROOT/sched.py" next "$st" "$wid" "$wt" "${ref[@]}")" || rc=$?
+      rc=0; job="$(python3 "$ROOT/lib/sched.py" next "$st" "$wid" "$wt" "${ref[@]}")" || rc=$?
       case $rc in
         0) ;;
         10) echo "✔ all tasks done"; break ;;
@@ -490,7 +490,7 @@ cmd_worker() {
       [[ -n "$note" ]] || note="$(tail -n "+$((n0 + 1))" "$log" | grep '"type":"result"' | tail -1 |
         jq -r 'select(.is_error) | "Session error: " + (.result // "unknown")' 2>/dev/null | cut -c1-300 || true)"
       [[ -n "$note" ]] && echo -e "\033[2m$note\033[0m"
-      python3 "$ROOT/sched.py" note "$st" "$(jq -r '.akey // ""' <<<"$j")" "$note"
+      python3 "$ROOT/lib/sched.py" note "$st" "$(jq -r '.akey // ""' <<<"$j")" "$note"
     fi
     autocommit "$wt" "$wid: ${task:0:70}" || true
     head="$(git -C "$wt" rev-parse HEAD)"
@@ -512,7 +512,7 @@ cmd_worker() {
         echo -e "\033[31m✖ could not merge; work kept on a parked branch, task goes back to the queue\033[0m"
       fi
     fi
-    ((conflict)) || python3 "$ROOT/sched.py" release "$st" "$wid"
+    ((conflict)) || python3 "$ROOT/lib/sched.py" release "$st" "$wid"
     run_end "$log" "$rid" "$(jq -n --arg h "$head" --arg m "$merged" --arg ts "$state" --arg s "${session:-cut off}" \
       --arg n "$note" --arg sm "$(final_field SUMMARY "$final")" --arg rc "$(final_field RESULT "$final")" \
       '{head: $h, merged: $m, task_state: $ts, session: $s, note: $n, summary: $sm, claimed: $rc}')"
@@ -572,10 +572,10 @@ cmd_status() {
     dir="$PROJECTS/$name"; [[ -d "$dir/.git" && -d "$RUN/$name/workers" ]] || continue
     echo -e "\033[1m$name\033[0m"
     if worker_alive "$name" main || [[ -z "$(live_workers "$name")" ]]; then
-      python3 "$ROOT/sched.py" status "$RUN/$name" "$dir"
+      python3 "$ROOT/lib/sched.py" status "$RUN/$name" "$dir"
     else
       main="$(git -C "$dir" symbolic-ref --short HEAD)"
-      python3 "$ROOT/sched.py" status "$RUN/$name" "$dir" --ref "$main"
+      python3 "$ROOT/lib/sched.py" status "$RUN/$name" "$dir" --ref "$main"
     fi
     echo
   done

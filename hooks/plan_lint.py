@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PostToolUse hook: after an edit to TODO.md, every open task needs a `why:` line and every section a
-`> why:` line (see plan.py; this is its stdlib-only core, since the sandbox has no harness venv).
+`> why:` line (see lib/plan.py; this is its stdlib-only core, since the sandbox has no harness venv).
 
 Tells the agent in the same turn (exit 2: stderr goes to the model), so fixing it costs no extra run.
 """

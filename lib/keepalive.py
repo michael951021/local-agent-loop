@@ -32,7 +32,7 @@ import phases   # noqa: E402  (which model-call phase a request belongs to)
 IDLE = 20        # seconds of upstream silence before a ping
 MAX_AGE = 1800   # no pings for requests older than this
 PING = b'event: ping\ndata: {"type": "ping"}\n\n'
-LEDGER = Path(__file__).resolve().parent / "logs" / "requests"
+LEDGER = Path(__file__).resolve().parent.parent / "logs" / "requests"
 USAGE = re.compile(rb'"(input_tokens|output_tokens|cache_read_input_tokens|cache_creation_input_tokens|'
                    rb'prompt_tokens|completion_tokens)":\s*(\d+)')
 SAMPLED = {"side", "unknown", "pipeline", "debrief", "handoff", "compact"}   # bodies kept for inspection

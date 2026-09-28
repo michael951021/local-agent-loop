@@ -23,7 +23,7 @@ cleanup() {
     n="$(basename "$n")"
     rm -rf "$ROOT/projects/$n" "$ROOT/work/$n" "$ROOT/run/$n" "$ROOT/reports/$n" "$ROOT"/logs/"$n"-*.jsonl
   done
-  python3 "$ROOT/ctxreport.py" --index 2>/dev/null
+  python3 "$ROOT/lib/ctxreport.py" --index 2>/dev/null
 }
 cleanup
 new() {   # new NAME TODO_BODY

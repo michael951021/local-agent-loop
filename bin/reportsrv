@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # The reports as a website on your local network (no more rsync): http://<this machine>:REPORTS_PORT/
 #
-#   ./reportsrv start      install + start the user service (restarts on failure, starts at login)
-#   ./reportsrv stop       stop and disable it
-#   ./reportsrv status     is it up, and the URLs to open
-#   ./reportsrv logs [-f]
+#   bin/reportsrv start      install + start the user service (restarts on failure, starts at login)
+#   bin/reportsrv stop       stop and disable it
+#   bin/reportsrv status     is it up, and the URLs to open
+#   bin/reportsrv logs [-f]
 #
 # Read-only, answers private/loopback addresses only. If ufw is on, allow the LAN once:
 #   sudo ufw allow from 192.168.0.0/16 to any port 8765 proto tcp
 # To keep it running while you are logged out: sudo loginctl enable-linger $USER
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 source "$ROOT/config.env"
 : "${REPORTS_PORT:=8765}"
 UNIT=agent-reports
@@ -29,7 +29,7 @@ case "${1:-}" in
 Description=Agent run reports on the local network (loop harness)
 
 [Service]
-ExecStart=$ROOT/.venv/bin/python3 $ROOT/reportsrv.py --port $REPORTS_PORT
+ExecStart=$ROOT/.venv/bin/python3 $ROOT/lib/reportsrv.py --port $REPORTS_PORT
 WorkingDirectory=$ROOT
 Restart=on-failure
 Nice=10

@@ -7,7 +7,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 
 DIM, BOLD, CYAN, GREEN, RED, RESET = "\033[2m", "\033[1m", "\033[36m", "\033[32m", "\033[31m", "\033[0m"
 
@@ -34,11 +34,11 @@ def report(trigger):
     # Delay so tee has flushed the last events to the log before the report reads it.
     if session:
         spawn("-c", "import subprocess,sys,time; time.sleep(3); subprocess.run(sys.argv[1:])",
-              sys.executable, ROOT / "ctxreport.py", "--session", session, "--trigger", trigger)
+              sys.executable, ROOT / "lib" / "ctxreport.py", "--session", session, "--trigger", trigger)
 
 
 session = None
-spawn(ROOT / "gpumon.py")   # no-op if already sampling
+spawn(ROOT / "lib" / "gpumon.py")   # no-op if already sampling
 
 for line in sys.stdin:
     try:

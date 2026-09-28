@@ -16,7 +16,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 LOGS = ROOT / "logs"
 TAGS = re.compile(r"\s*\((?:id|after): [^)]*\)")
 
@@ -32,7 +32,7 @@ def clean_task(t):
 
 def _split_title():
     import importlib.util   # sched.py, not the standard library's sched module
-    spec = importlib.util.spec_from_file_location("agent_sched", ROOT / "sched.py")
+    spec = importlib.util.spec_from_file_location("agent_sched", ROOT / "lib" / "sched.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.split_title

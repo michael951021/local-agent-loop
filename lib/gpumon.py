@@ -9,7 +9,7 @@ import subprocess
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 OUT, PIDFILE = ROOT / "logs" / "gpu", ROOT / "run" / "gpumon.pid"
 IDLE_EXIT = 900
 QUERY = "index,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu"

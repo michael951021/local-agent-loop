@@ -20,7 +20,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 REPORTS = ROOT / "reports"
 REFRESH = 60
 LIVE = b"""<script>(()=>{const p=location.pathname,k='scroll:'+p;let m=null;
@@ -40,7 +40,7 @@ def refresh():
     try:
         _last = time.time()
         for cmd in (["diffpage.py", "--live"], ["ctxreport.py", "--index"]):
-            subprocess.run([sys.executable, str(ROOT / cmd[0]), *cmd[1:]], cwd=ROOT, capture_output=True, timeout=300)
+            subprocess.run([sys.executable, str(ROOT / "lib" / cmd[0]), *cmd[1:]], cwd=ROOT, capture_output=True, timeout=300)
     except subprocess.TimeoutExpired:
         pass
     finally:

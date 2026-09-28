@@ -35,7 +35,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 LINE = re.compile(r"^\s*- \[( |x|X)\] (.*)$")
 ID = re.compile(r"\(id: *([\w.-]+)\)")
 AFTER = re.compile(r"\(after: *([^)]*)\)")

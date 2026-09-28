@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Every point where the loop calls the model: what for, how often, and why it is its own call.
 
-  phases.py            print the registry (the table in LLM_CALLS.md is generated from it)
+  phases.py            print the registry (the table in docs/LLM_CALLS.md is generated from it)
   phases.py --md       the registry as Markdown
   phases.py --measure [SINCE_HOURS]   calls, tokens and GPU time per phase from logs/requests/
 
@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 PROMPTS = ROOT / "prompts"
 
 

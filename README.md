@@ -28,6 +28,21 @@ Full transcripts are in `logs/*.jsonl`. Each finished task gets a 3-line entry (
 blockers) appended to `projects/NAME/TASKLOG.md`; `projects/NAME/NOTES.md` is the rolling
 current-state handoff the next iteration reads, not a log.
 
+## Layout
+
+| Path | What |
+|---|---|
+| `agent` | the CLI: new, loop, chat, run, shell, status, stop, setup |
+| `config.env` | models, backend, agents, limits |
+| `bin/` | service helpers: `llamasrv` (llama-server unit), `reportsrv` (reports on the LAN) |
+| `lib/` | the Python behind them. Loop: `sched.py`, `plan.py`, `mergelines.py`, `pretty.py`. Model traffic: `keepalive.py`, `bridge.py`, `chat_template.py`, `phases.py`. Reports: `telemetry.py`, `reportui.py`, `ctxreport.py`, `fleet.py`, `diffpage.py`, `gpumon.py`, `reportsrv.py` |
+| `hooks/`, `prompts/`, `mcp/` | mounted read-only into the sandbox at `/opt/agent/` |
+| `home/` | the sandbox's home directory (only `.claude/` settings, CLAUDE.md and agents are tracked) |
+| `template/` | files `./agent new` copies into a new project |
+| `tests/` | `smoke.sh` (harness test with a fake claude), `llama_bench.py` |
+| `docs/` | `LLM_CALLS.md` (every model call, generated from `lib/phases.py`) |
+| `projects/`, `work/`, `run/`, `logs/`, `reports/` | per-machine state, gitignored |
+
 ## Parallel agents
 
 `./agent loop NAME` starts `AGENTS` agents (config.env, default 2; `-j N` overrides). With one, the
@@ -68,7 +83,7 @@ time, whatever `OLLAMA_NUM_PARALLEL` says, and reuses almost none of the previou
 Ollama, as a user systemd unit, with no root needed:
 
 ```bash
-./llamasrv start | stop | status | logs [-f]   # ./agent starts it by itself when needed
+bin/llamasrv start | stop | status | logs [-f]   # ./agent starts it by itself when needed
 ```
 
 It unloads the model from Ollama first (both copies do not fit). `NUM_PARALLEL` slots of `NUM_CTX`
@@ -86,9 +101,9 @@ compaction); `reports/index.html` lists them and `reports/fleet.html` shows all 
 timeline with their share of the GPUs. Each run also gets a diff page,
 `reports/<project>/diffs/<run>.html`: every file it changed, line by line, with its commits
 (merge-conflict fixes show only the resolution; a run still going shows its work so far,
-uncommitted files included). `./diffpage.py --all` rebuilds them for past runs.
+uncommitted files included). `lib/diffpage.py --all` rebuilds them for past runs.
 
-**On your network:** `./reportsrv start` serves the reports at `http://<this machine>:8765/`
+**On your network:** `bin/reportsrv start` serves the reports at `http://<this machine>:8765/`
 (user service, starts at login). Pages reload themselves when they change, and opening the index
 refreshes it and the running agents' diffs, so there is nothing to sync. It answers only
 private/loopback addresses and is read-only. With ufw on, allow the LAN once:
@@ -99,7 +114,7 @@ private/loopback addresses and is read-only. With ufw on, allow the LAN once:
 | Record | `./agent` (harness lines in `logs/*.jsonl`), `keepalive.py` (`logs/requests/`), `gpumon.py` (`logs/gpu/`), Ollama's journal | write facts as they happen, tagged by agent |
 | Read | `telemetry.py` | parse and join them: runs, requests per agent, fair GPU share, VRAM split |
 | Render | `reportui.py`, `ctxreport.py`, `fleet.py`, `diffpage.py` | per-run page, index, fleet page, diff pages |
-| Serve | `reportsrv.py` (`./reportsrv`) | the folder on the LAN, live |
+| Serve | `reportsrv.py` (`bin/reportsrv`) | the folder on the LAN, live |
 | Trigger | `./agent` (end of run), `pretty.py` (compaction) | call the renderer; never block the agent |
 
 ## Plan and model calls
@@ -107,8 +122,8 @@ private/loopback addresses and is read-only. With ufw on, allow the LAN once:
 - **Plan tree** (`plan.py`, Pydantic): TODO.md is a goal, then sections, then tasks. Each section has a `> why:` line
   and each task an indented `why:` line. The agent sees the chain above its task ("Where this fits"), and the reports
   show it too. `hooks/plan_lint.py` tells the agent right away when a line it wrote has no why.
-  Run `.venv/bin/python plan.py tree|lint FILE` to print or check it.
-- **Model calls** (`phases.py`, [LLM_CALLS.md](LLM_CALLS.md)): every call the loop makes, when it happens, how many
+  Run `.venv/bin/python lib/plan.py tree|lint FILE` to print or check it.
+- **Model calls** (`phases.py`, [docs/LLM_CALLS.md](docs/LLM_CALLS.md)): every call the loop makes, when it happens, how many
   times, and why it can't be folded into another. The proxy tags each request with its phase. A run's outcome comes
   from the RESULT block in the agent's final message, and a separate debrief call is only a fallback.
 

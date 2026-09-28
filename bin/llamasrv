@@ -2,15 +2,15 @@
 # Run the agent model on llama.cpp's llama-server (the one Ollama ships) instead of Ollama, so N agents
 # get N real slots: Ollama 0.33 refuses parallel requests for qwen35 (hybrid attention/recurrent) models.
 #
-#   ./llamasrv start [extra llama-server args]   unload the model from Ollama, start the server (user unit)
-#   ./llamasrv stop                              stop it (Ollama loads the model again on its next request)
-#   ./llamasrv status                            unit state, slots, VRAM
-#   ./llamasrv logs [-f]                         the server log (journalctl --user -u llama-agent)
+#   bin/llamasrv start [extra llama-server args]   unload the model from Ollama, start the server (user unit)
+#   bin/llamasrv stop                              stop it (Ollama loads the model again on its next request)
+#   bin/llamasrv status                            unit state, slots, VRAM
+#   bin/llamasrv logs [-f]                         the server log (journalctl --user -u llama-agent)
 #
 # Settings come from config.env: MODEL (served under that name), BASE_MODEL (whose GGUF is used),
 # NUM_CTX (per slot), NUM_PARALLEL (slots), LLAMA_URL, LLAMA_ARGS (extra flags). No root needed.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 source "$ROOT/config.env"
 : "${NUM_PARALLEL:=1}" "${LLAMA_URL:=http://127.0.0.1:11500}" "${LLAMA_ARGS:=}"
 BIN="${LLAMA_SERVER:-/usr/local/lib/ollama/llama-server}"
@@ -26,12 +26,12 @@ gguf() {   # the model weights blob of BASE_MODEL (first FROM of its Modelfile)
 cmd_start() {
   mkdir -p "$ROOT/run"; exec 9>"$ROOT/run/llamasrv.lock"; flock 9   # agents starting together start it once
   curl -sf "$LLAMA_URL/health" >/dev/null && { echo "$UNIT already running ($LLAMA_URL)"; return; }
-  systemctl --user is-active -q "$UNIT" && { echo "$UNIT is running but not healthy (./llamasrv logs)"; return 1; }
+  systemctl --user is-active -q "$UNIT" && { echo "$UNIT is running but not healthy (bin/llamasrv logs)"; return 1; }
   local model; model="$(gguf)"; [[ -r "$model" ]] || die "cannot read the GGUF of $BASE_MODEL ($model)"
   # Free the GPUs: both copies of a 27B model do not fit.
   for m in $(ollama ps | awk 'NR>1{print $1}'); do ollama stop "$m"; done
   local port="${LLAMA_URL##*:}" tpl="$ROOT/run/chat-template.jinja"
-  python3 "$ROOT/chat_template.py" "$model" > "$tpl"   # the GGUF's template, patched for Claude Code
+  python3 "$ROOT/lib/chat_template.py" "$model" > "$tpl"   # the GGUF's template, patched for Claude Code
   # Each slot gets exactly NUM_CTX tokens (no unified pool one agent could fill); context checkpoints let a
   # hybrid model reuse the unchanged start of a prompt, and --cache-ram keeps more of them in host RAM.
   systemd-run --user --unit="$UNIT" --collect --quiet \
@@ -50,7 +50,7 @@ cmd_start() {
     systemctl --user is-active -q "$UNIT" || { echo; journalctl --user -u "$UNIT" -n 30 --no-pager; die "server exited"; }
     printf .; sleep 1
   done
-  die "not ready after 5 min (./llamasrv logs)"
+  die "not ready after 5 min (bin/llamasrv logs)"
 }
 
 cmd_stop() { systemctl --user stop "$UNIT" 2>/dev/null && echo "stopped $UNIT" || echo "$UNIT not running"; }
