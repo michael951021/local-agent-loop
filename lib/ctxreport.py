@@ -402,6 +402,11 @@ def crumb(s):
     return f'<div class="note" style="margin:0">{html.escape(" › ".join(secs))}</div>' if secs else ""
 
 
+def dur(m):
+    """Minutes as '42 min' or '1h 05m'."""
+    return "–" if m is None else f"{m:.0f} min" if m < 60 else f"{int(m // 60)}h {int(m % 60):02d}m"
+
+
 def diff_cell(d, live=False, run=None, project=None):
     if live and (REPORTS / project / "diffs" / f"{run}.html").exists():
         return f'<a href="{project}/diffs/{run}.html">so far</a>'
@@ -439,7 +444,7 @@ def build_index():
             f'<td>{"continued" if st.get("resumed") else ""}</td><td><b>… running</b>'
             f'<div class="note">for {(time.time() - st["t"]) / 60:.0f} min; report when it ends</div></td>'
             f'<td class="num">{so_far}</td>'
-            f'<td class="num">{(time.time() - st["t"]) / 60:.1f}</td>' + '<td class="num">–</td>' * 5 + '</tr>')
+            f'<td class="num">{dur((time.time() - st["t"]) / 60)}</td>' + '<td class="num">–</td>' * 5 + '</tr>')
     for k, (f, s) in sorted(runs.items(), key=lambda kv: (kv[1][1]["start"], kv[1][0].name), reverse=True):
         who = s.get("tag") or s["project"]
         r = s.get("result") or {"label": s["outcome"], "cls": "", "why": ""}
@@ -457,10 +462,10 @@ def build_index():
             f'<td><span class="{r["cls"]}" title="{html.escape(r["why"])}"><b>{html.escape(r["label"])}</b></span>'
             f'<div class="note">{html.escape(r["why"])}{" · " + " · ".join(side) if side else ""}</div></td>'
             f'<td class="num">{diff_cell(s.get("diff"), live=s.get("run") in live_ids, run=s.get("run"), project=s["project"])}</td>'
-            f'<td class="num">{s["wall_min"]}</td><td class="num">{s["turns"]}</td>'
+            f'<td class="num">{dur(s["wall_min"])}</td><td class="num">{s["turns"]}</td>'
             f'<td class="num">{s["peak_pct"]}%</td><td class="num">{s["think_pct"]}%</td>'
             f'<td class="num">{s["gen_tps"] and round(s["gen_tps"], 1)}</td>'
-            f'<td class="num">{s["share_pct"] if s.get("share_pct") is not None else "–"}</td></tr>')
+            f'<td class="num">{str(s["share_pct"]) + "%" if s.get("share_pct") is not None else "–"}</td></tr>')
     REPORTS.mkdir(exist_ok=True)
     (REPORTS / "index.html").write_text(INDEX.replace("__ROWS__", "\n".join(rows)))
     try:
@@ -510,10 +515,11 @@ INDEX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div class="sub">One row per run, newest first. <b>Result</b> is what became of the task (done / not finished /
  interrupted / split / merge fix), not whether the Claude session ended cleanly; when a task was not finished the
  agent's own note says why and what would have helped.
- · <a href="fleet.html"><b>Fleet view</b></a>: every agent on one timeline, and how they share the GPUs</div>
-<section class="card" style="overflow-x:auto"><table><tr><th>Start</th><th>Agent</th><th>Task</th><th>Attempt</th><th>Result</th><th class="num">Changes</th>
-<th class="num">Min</th><th class="num">Turns</th><th class="num">Peak ctx</th><th class="num">Thinking</th>
-<th class="num">Gen t/s</th><th class="num">GPU share %</th></tr>
+ Times are local (America/New_York); <b>Duration</b> is wall-clock time (h, min).
+ · <a href="study.html"><b>Study</b></a>: every run aggregated · <a href="fleet.html"><b>Fleet view</b></a>: every agent on one timeline, and how they share the GPUs</div>
+<section class="card" style="overflow-x:auto"><table><tr><th title="Local time (America/New_York) the run started">Start (local)</th><th>Agent</th><th>Task</th><th>Attempt</th><th>Result</th><th class="num">Changes</th>
+<th class="num" title="Wall-clock length of the run, from the harness start line to its end line">Duration</th><th class="num" title="Model calls (API turns) in the run">Turns</th><th class="num" title="Largest prompt of the run, as % of the context window">Peak ctx</th><th class="num" title="Share of all context growth that was the model's own thinking">Thinking</th>
+<th class="num" title="Median generation speed of this run's model requests, tokens per second">Gen tok/s</th><th class="num" title="This run's share of busy GPU time while it ran">GPU share</th></tr>
 __ROWS__</table></section></main></body></html>"""
 
 
@@ -523,7 +529,7 @@ const pk=S.peak_pct,pkc=pk>=85?'bad':pk>=65?'warn':'';
 const who=D.worker&&D.worker!=='main'?`${esc(D.project)} / <b>${esc(D.worker)}</b>`:esc(D.project);
 const merge={yes:'merged',conflict:'<span class="warn">merge conflict</span>',parked:'<span class="bad">parked</span>',nothing:'no changes'}[D.merged]||'';
 const crumbs=(D.path||[]).filter(s=>s.kind!=='task');
-let h=(crumbs.length?`<div class="note" style="margin:0 0 4px">${crumbs.map(s=>`<span title="${esc(s.why||'')}">${esc(s.title)}</span>`).join(' › ')}</div>`:'')+`<h1>${esc(D.title)}</h1>${D.spec&&D.spec!==D.title?`<div class="note" style="max-width:900px;margin:-4px 0 8px">${esc(D.spec)}</div>`:''}<div class="sub">${who} · ${D.start} · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
+let h=(crumbs.length?`<div class="note" style="margin:0 0 4px">${crumbs.map(s=>`<span title="${esc(s.why||'')}">${esc(s.title)}</span>`).join(' › ')}</div>`:'')+`<h1>${esc(D.title)}</h1>${D.spec&&D.spec!==D.title?`<div class="note" style="max-width:900px;margin:-4px 0 8px">${esc(D.spec)}</div>`:''}<div class="sub">${who} · started ${D.start} (local) · ${mins(S.wall_min)} · session <span class="mono">${D.sid.slice(0,8)}</span>${D.branch?' · '+esc(D.branch):''}${merge?' · '+merge:''} · report on <b>${D.trigger}</b> · <a href="../index.html">all reports</a> · <a href="../fleet.html">fleet</a></div>`;
 h+='<div class="tiles">'+[
  tile('Peak context',k(S.peak),`${pk}% of ${k(D.window)} window${S.real_peak?` · the server saw ${k(S.real_peak)}`:''}`,pkc),
  D.diff?tile('Changes',`<a href="../${esc(D.diff.path)}">${D.diff.files} file${D.diff.files==1?'':'s'}</a>`,`<span style="color:var(--c3)">+${D.diff.add}</span> <span class="bad">−${D.diff.del}</span> · <a href="../${esc(D.diff.path)}">view the diff</a>`):'',
@@ -572,6 +578,8 @@ h+='<div class="grid2">'+card('Model requests: time per request','Seconds spent 
  +card('Model requests: prompt cache','Prompt tokens reused from Ollama\'s cache vs re-processed from scratch',
  '<div id="rcache"></div>'+legend([{n:'Reused',c:col(2)},{n:'Re-processed',c:col(7)}]))+'</div>';
 
+h+=card('Speed over the run','Tokens per second of each model request, by minutes into the run. Generation = new tokens written; prefill = prompt tokens read (only requests that read over 1k new tokens). When two agents share the GPUs both drop.',
+ '<div class="grid2"><div><div class="note">Generation tok/s</div><div id="sgen"></div></div><div><div class="note">Prefill tok/s</div><div id="spp"></div></div></div>');
 const G=D.gpu,gid=G.ids.map((g,i)=>({n:'GPU '+g,c:col(i)}));
 h+='<div class="grid3">'+card('GPU utilization','% per GPU, 5 s samples','<div id="gu"></div>'+legend(gid))
  +card('VRAM','GB per GPU, of '+(G.ids.length?f1(G.cap_gb/G.ids.length):'–')+' GB each','<div id="gv"></div>'+legend(gid))
@@ -582,9 +590,9 @@ h+='<div class="grid2">'+card('Tools','Result tokens are what each tool added to
  D.tools.map(t=>`<tr><td>${esc(t.name)}</td><td class="num">${t.calls}</td><td class="num">${k(t.tokens)}</td><td class="num">${k(t.calls?t.tokens/t.calls:0)}</td></tr>`).join('')+'</table>')
  +card('Commits during the run',D.diff?`<a href="../${esc(D.diff.path)}">Full diff of this run →</a>`:D.commits.length?'':'none','<ul class="commits mono">'+D.commits.map(c=>`<li>${esc(c)}</li>`).join('')+'</ul>')+'</div>';
 
-h+=card('Per-turn data','','<details><summary>Turn-by-turn table ('+D.calls.length+' rows)</summary><div class="scroll"><table><tr><th class="num">Turn</th><th class="num">Min</th><th class="num">Context</th><th class="num">Δ</th><th>Largest addition</th></tr>'+
+h+=card('Per-turn data','','<details><summary>Turn-by-turn table ('+D.calls.length+' rows)</summary><div class="scroll"><table><tr><th class="num">Turn</th><th class="num" title="Minutes since the run started">Min into run</th><th class="num">Context</th><th class="num">Δ</th><th>Largest addition</th></tr>'+
  D.calls.map(c=>`<tr><td class="num">${c.turn}</td><td class="num">${f1(c.min)}</td><td class="num">${k(c.total)}</td><td class="num">${c.delta>=0?'+':''}${k(c.delta)}</td><td>${esc(c.added)}</td></tr>`).join('')+'</table></div></details>'+
- '<details><summary>Model requests ('+D.reqs.length+' rows)</summary><div class="scroll"><table><tr><th class="num">Min</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Prefill s</th><th class="num">Gen tok</th><th class="num">Gen s</th><th class="num">t/s</th><th>Flags</th></tr>'+
+ '<details><summary>Model requests ('+D.reqs.length+' rows)</summary><div class="scroll"><table><tr><th class="num" title="Minutes since the run started">Min into run</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Prefill s</th><th class="num">Gen tok</th><th class="num">Gen s</th><th class="num">t/s</th><th>Flags</th></tr>'+
  D.reqs.map(r=>`<tr><td class="num">${f1(r.min)}</td><td class="num">${k(r.prompt)}</td><td class="num">${k(r.reused)}</td><td class="num">${f1(r.prefill_s)}</td><td class="num">${r.gen}</td><td class="num">${f1(r.gen_s)}</td><td class="num">${f1(r.tps)}</td><td>${[r.full?'full reprocess':'',r.cancelled?'cancelled':''].filter(Boolean).join(', ')}</td></tr>`).join('')+'</table></div></details>');
 app.innerHTML=h;
 if(D.share)lanes(document.getElementById('lanes'),{x1:S.wall_min,xfmt:v=>Math.round(v)+'m',
@@ -601,7 +609,12 @@ chart(document.getElementById('rtime'),{x:R.map((r,i)=>i+1),bars:true,stacked:tr
  series:[{n:'Prefill',c:col(0),v:R.map(r=>r.prefill_s)},{n:'Generation',c:col(1),v:R.map(r=>r.gen_s)}]});
 chart(document.getElementById('rcache'),{x:R.map((r,i)=>i+1),bars:true,stacked:true,xlabel:'request',tipx:rt,
  series:[{n:'Reused',c:col(2),v:R.map(r=>r.reused)},{n:'Re-processed',c:col(7),v:R.map(r=>r.processed)}]});
-const gx={x:G.t,xfmt:v=>Math.round(v)+'m',H:170,tipx:i=>`<b>${mins(G.t[i])}</b>`};
+const Rg=R.filter(r=>r.tps),Rp=R.filter(r=>r.prefill_s&&r.processed>1000);
+chart(document.getElementById('sgen'),{x:Rg.map(r=>r.min),H:170,xfmt:v=>Math.round(v)+'m',xlabel:'min into run',yfmt:v=>f1(v),
+ series:[{n:'generation tok/s',c:col(1),v:Rg.map(r=>r.tps)}],tipx:i=>`<b>${mins(Rg[i].min)} in</b><div class="note">${Rg[i].gen} tokens in ${f1(Rg[i].gen_s)} s</div>`});
+chart(document.getElementById('spp'),{x:Rp.map(r=>r.min),H:170,xfmt:v=>Math.round(v)+'m',xlabel:'min into run',
+ series:[{n:'prefill tok/s',c:col(0),v:Rp.map(r=>r.processed/r.prefill_s)}],tipx:i=>`<b>${mins(Rp[i].min)} in</b><div class="note">${k(Rp[i].processed)} tokens read in ${f1(Rp[i].prefill_s)} s</div>`});
+const gx={x:G.t,xfmt:v=>Math.round(v)+'m',xlabel:'min into run',H:170,tipx:i=>`<b>${mins(G.t[i])}</b>`};
 chart(document.getElementById('gu'),{...gx,ymax:100,yfmt:v=>Math.round(v)+'%',series:G.ids.map((g,i)=>({n:'GPU '+g,c:col(i),v:G.util[i]}))});
 chart(document.getElementById('gv'),{...gx,ymax:G.ids.length?G.cap_gb/G.ids.length:null,yfmt:v=>f1(v),series:G.ids.map((g,i)=>({n:'GPU '+g,c:col(i),v:G.vram[i]}))});
 chart(document.getElementById('gp'),{...gx,yfmt:v=>Math.round(v)+'W',series:G.ids.map((g,i)=>({n:'GPU '+g,c:col(i),v:G.power[i]}))});

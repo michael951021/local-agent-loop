@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 ROOT = Path(__file__).resolve().parent.parent
 REPORTS = ROOT / "reports"
 REFRESH = 60
+STUDY_EVERY = 15 * 60   # seconds between rebuilds of study.html
 LIVE = b"""<script>(()=>{const p=location.pathname,k='scroll:'+p;let m=null;
 try{const y=sessionStorage.getItem(k);if(y!=null){scrollTo(0,+y);sessionStorage.removeItem(k)}}catch(e){}
 async function poll(){try{const r=await fetch('/__mtime?p='+encodeURIComponent(p),{cache:'no-store'});const t=await r.text();
@@ -39,7 +40,11 @@ def refresh():
         return
     try:
         _last = time.time()
-        for cmd in (["diffpage.py", "--live"], ["ctxreport.py", "--index"]):
+        cmds = [["diffpage.py", "--live"], ["ctxreport.py", "--index"]]
+        study = REPORTS / "study.html"
+        if not study.exists() or time.time() - study.stat().st_mtime > STUDY_EVERY:
+            cmds.append(["study.py"])   # every run aggregated; ~10 s with its per-log cache
+        for cmd in cmds:
             subprocess.run([sys.executable, str(ROOT / "lib" / cmd[0]), *cmd[1:]], cwd=ROOT, capture_output=True, timeout=300)
     except subprocess.TimeoutExpired:
         pass

@@ -113,7 +113,7 @@ private/loopback addresses and is read-only. With ufw on, allow the LAN once:
 |---|---|---|
 | Record | `./agent` (harness lines in `logs/*.jsonl`), `keepalive.py` (`logs/requests/`), `gpumon.py` (`logs/gpu/`), Ollama's journal | write facts as they happen, tagged by agent |
 | Read | `telemetry.py` | parse and join them: runs, requests per agent, fair GPU share, VRAM split |
-| Render | `reportui.py`, `ctxreport.py`, `fleet.py`, `diffpage.py` | per-run page, index, fleet page, diff pages |
+| Render | `reportui.py`, `ctxreport.py`, `fleet.py`, `diffpage.py`, `study.py` | per-run page, index, fleet page, diff pages, study (every run aggregated: time split, tokens by kind, tools, context, 1 vs 2 agents, GPU; CSVs in reports/study/) |
 | Serve | `reportsrv.py` (`bin/reportsrv`) | the folder on the LAN, live |
 | Trigger | `./agent` (end of run), `pretty.py` (compaction) | call the renderer; never block the agent |
 
