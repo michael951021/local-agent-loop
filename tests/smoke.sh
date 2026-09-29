@@ -41,6 +41,13 @@ wait_idle() {   # wait until NAME has no live agents (max 180 s)
   done; return 1
 }
 reports() { ls "$ROOT/reports/$1/"*-end.json 2>/dev/null | wc -l; }
+wait_reports() {  # report generation is deliberately asynchronous, including after a hard kill
+  local n; for n in $(seq 30); do
+    [[ $(reports "$1") -ge $2 ]] && return 0
+    sleep 1
+  done
+  return 1
+}
 runs()    { cat "$ROOT"/logs/"$1"-*.jsonl 2>/dev/null | grep -c '^{"type":"harness","event":"end"'; }
 
 echo "1. two agents, one project"
@@ -125,7 +132,7 @@ for _ in $(seq 30); do [[ -f "$ROOT/run/$P-kill/workers/main.json" ]] && break; 
 check "killed: no handoff yet" bash -c "[[ ! -f '$ROOT/run/$P-kill/workers/main.resume' ]]"
 out="$(timeout 50 "$A" loop "$P-kill" -j 1 </dev/null 2>&1)"
 check "restart wrote the handoff and continued K" bash -c "grep -q 'asking it for a handoff' <<<\"\$0\" && grep -q '^- \[x\] K' '$ROOT/projects/$P-kill/TODO.md'" "$out"
-check "the killed run got its end report" bash -c "[[ \$(ls '$ROOT/reports/$P-kill/'*-end.json 2>/dev/null | wc -l) -ge 2 ]]"
+check "the killed run got its end report" wait_reports "$P-kill" 2
 
 [[ -n "${KEEP:-}" ]] || cleanup
 if ((fails)); then echo -e "\033[31m$fails check(s) failed\033[0m"; exit 1; fi

@@ -4,24 +4,30 @@ BE SUCCINCT. Think and write in the fewest words that stay correct: short senten
 restating the task, no narrating what you are about to do. Prose costs context and slows every later run.
 If it can be said in 25 words, do not use 50.
 
-Context is limited. Do not read TODO.md in full; use `grep -n` on it if you need to find a line.
-Read NOTES.md (the handoff from earlier runs) and CLAUDE.md. Read other files only when the task needs them,
-and use `head`, `grep` or line ranges instead of whole large files.
+Context is limited. SessionStart supplies a bounded NOTES.md snapshot: use it instead of rereading the
+same file. Read CLAUDE.md and only the files needed for the assigned task. Locate symbols with `rg -n`,
+then Read small offset/limit ranges (start with 80 lines). Large Read requests are blocked by a hook;
+use a narrower range, not a whole-file shell read. Do not read TODO.md in full.
 
-1. **Expand the ticket first** (only if the harness gave you a ticket-spec path below). Before coding, write
-   that file: three short sections — `## Issue` (what is wrong / what is needed), `## Done when` (the check or
-   test that proves it), `## Plan` (the approach). A few lines each, whole file under ~15 lines. It is your
-   contract for this ticket and is shown on the board; keep it truthful and terse, and update it if the plan
-   changes.
-2. Implement the task.
-3. Run the tests or run the code to prove it works. Fix whatever fails. Pipe long output through `tail`.
+1. **Expand the ticket first** if the harness gives you a ticket-spec path. Follow the contract fields
+   below: one question, starting evidence, a falsifiable check, scope and stopping condition, and plan.
+   For checklist steps, use those same criteria for the assigned step; do not rewrite the whole milestone.
+2. Implement the task. After two attempts without new evidence, stop and record what is missing, or split
+   the task. Repeating a failing command or speculation is not progress. Investigations may conclude that
+   behavior is intended; preserve the evidence instead of inventing a fix to satisfy a checkbox.
+3. Prove it works with the smallest relevant test, then required checks. Preserve long output with:
+   `python3 /opt/agent/hooks/capture.py --log /work/.agent-evidence/<unique-name>.log --timeout 300 -- <command>`
+   Ensure `.agent-evidence/` is gitignored before using it. This prints a bounded tail and returns the command's actual exit code. Search the saved log for earlier
+   failures. Never infer success from a tail pipeline's exit code. Keep evidence paths and the test result
+   in the handoff; do not paste full logs or commit generated evidence unless the task requires it.
 4. Change that task's line from `- [ ]` to `- [x]` in the file named in the task header (TODO.md or a checklist).
    Edit only that line, and leave its `(id: ...)` / `(after: ...)` tags as they are (the scheduler reads them).
    If the step failed and you took a checklist's On failure path instead, leave it.
    Exception: a TODO.md milestone line ending in `(checklist: PATH)` is checked only when the line itself says so.
 5. Update NOTES.md. It is a short current-state summary, not a log: keep it under 4 KB and ~60 lines.
    Rewrite or delete outdated lines instead of appending. Keep only what later runs need:
-   decisions, commands, file locations, gotchas. If it is over 4 KB now, condense it first
+   question answered or still open, decisions and supporting evidence paths, commands with exit codes,
+   file locations, gotchas, and the next discriminating check. Separate observations from hypotheses. If it is over 4 KB now, condense it first
    (merging parallel work can leave two versions of a line: keep the true one).
 6. Append an entry to TASKLOG.md (create it with a one-line header if it doesn't exist yet). Unlike NOTES.md,
    this is a permanent record — never edit or delete earlier entries, only append. Exactly 3 lines for this task:

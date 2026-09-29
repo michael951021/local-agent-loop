@@ -20,6 +20,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import contextaudit
 import ctxreport  # noqa: E402  (analyse(): context per call, the categories)
 import reportui  # noqa: E402
 from telemetry import (LOGS, ROOT, agent_tag, attribute, gpu_samples, harness_runs, ledger,  # noqa: E402
@@ -27,6 +28,7 @@ from telemetry import (LOGS, ROOT, agent_tag, attribute, gpu_samples, harness_ru
 
 OUT = ROOT / "reports"
 CACHE = ROOT / "run" / "study-cache"
+CACHE_VERSION = 2  # context audit schema; invalidate old derived data
 SKIP = re.compile(r"^(smoke|captest|hooktest|zz)")
 # When the model server changed (local time, from the harness history and the llama-agent journal).
 ERAS = [("Ollama, 1 slot", 0),
@@ -126,39 +128,40 @@ def parse_log(log):
                         tools.append(p)
         cur.update(calls=[{"t": c["t"], "total": c["total"], "comp": c["comp"]} for c in a["calls"]],
                    compactions=len(a["compactions"]), retries=a["retries"], tools=tools, gen=dict(gen),
-                   t0=a["t0"], t1=a["t1"])
+                   t0=a["t0"], t1=a["t1"], audit=a["audit"])
         if cur.get("pseudo"):
             cur["start"]["t"] = a["t0"]
             cur["end"] = {"t": a["t1"], "task_state": None}
         if cur["start"]["t"]:
             runs.append(cur)
 
-    for line in open(log, errors="replace"):
-        if line.startswith('{"type":"system","subtype":"thinking_tokens"'):
-            continue
-        if line.startswith('{"type":"harness"'):
-            d = json.loads(line)
-            if d.get("event") == "start":
-                close()
-                cur, events = {"start": d, "end": None}, []
-            elif d.get("event") == "end" and cur is not None and d.get("run") == cur["start"]["run"]:
-                cur["end"] = d
-            continue
-        if '"subtype":"init"' in line and (cur is None or cur.get("pseudo")):
-            d = json.loads(line)
-            if cur is None or cur["start"]["run"] != d.get("session_id"):
-                close()
-                m = re.match(r"(.+?)(?:-(w\d+))?-\d{8}-\d{6}\.jsonl$", Path(log).name)
-                cur, events = {"start": {"run": d.get("session_id"), "project": m.group(1) if m else "?",
-                                         "worker": m.group(2) or "main" if m else "main", "t": None},
-                               "end": None, "pseudo": True}, []
-        if cur is None or not ('"type":"assistant"' in line or '"type":"user"' in line or '"type":"system"' in line
-                               or '"type":"result"' in line):
-            continue
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
+    with open(log, errors="replace") as source:
+        for line in source:
+            if line.startswith('{"type":"system","subtype":"thinking_tokens"'):
+                continue
+            if line.startswith('{"type":"harness"'):
+                d = json.loads(line)
+                if d.get("event") == "start":
+                    close()
+                    cur, events = {"start": d, "end": None}, []
+                elif d.get("event") == "end" and cur is not None and d.get("run") == cur["start"]["run"]:
+                    cur["end"] = d
+                continue
+            if '"subtype":"init"' in line and (cur is None or cur.get("pseudo")):
+                d = json.loads(line)
+                if cur is None or cur["start"]["run"] != d.get("session_id"):
+                    close()
+                    m = re.match(r"(.+?)(?:-(w\d+))?-\d{8}-\d{6}\.jsonl$", Path(log).name)
+                    cur, events = {"start": {"run": d.get("session_id"), "project": m.group(1) if m else "?",
+                                             "worker": m.group(2) or "main" if m else "main", "t": None},
+                                   "end": None, "pseudo": True}, []
+            if cur is None or not ('"type":"assistant"' in line or '"type":"user"' in line or '"type":"system"' in line
+                                   or '"type":"result"' in line):
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
     close()
     return runs
 
@@ -173,11 +176,11 @@ def load_runs():
         key = CACHE / f"{log.stem}.json"
         if key.exists():
             c = json.loads(key.read_text())
-            if c["size"] == st.st_size and c["mtime"] == st.st_mtime:
+            if c.get("version") == CACHE_VERSION and c["size"] == st.st_size and c["mtime"] == st.st_mtime:
                 runs += c["runs"]
                 continue
         rs = parse_log(log)
-        key.write_text(json.dumps({"size": st.st_size, "mtime": st.st_mtime, "runs": rs}))
+        key.write_text(json.dumps({"version": CACHE_VERSION, "size": st.st_size, "mtime": st.st_mtime, "runs": rs}))
         runs += rs
     return [r for r in runs if r["start"].get("project") and not SKIP.match(r["start"]["project"]) and r["calls"]]
 
@@ -256,6 +259,9 @@ def collect():
             "gen_s": sum(q["gen_s"] or 0 for q in mine), "tool_s": tool_s, "requests": len(mine),
             "gen_tok": sum(q["gen"] for q in mine), "turns": len(r["calls"]), "compactions": r["compactions"],
             "peak": max(c["total"] for c in r["calls"]), "window": st.get("num_ctx") or max((q["n_ctx"] for q in mine), default=131072),
+            "audit": r["audit"], "run": st["run"], "policy": st.get("context_policy", "unrecorded"),
+            "harness_revision": st.get("harness_revision", "unrecorded"),
+            "read_max_lines": st.get("read_max_lines"), "read_max_chars": st.get("read_max_chars"),
             "calls": r["calls"], "tools": r["tools"], "gen": r["gen"], "checklist": bool(st.get("parent")),
         })
     for x in rows:
@@ -415,11 +421,14 @@ def collect():
               "built": time.strftime("%Y-%m-%d %H:%M")}
     rb = lambda qs: round(100 * sum(q["reused"] for q in qs) / max(1, sum(q["prompt"] for q in qs)), 1)
     reuse_by_era = {"ollama": rb([q for q in reqs if q["era"] == 0]), "llama": rb([q for q in reqs if q["era"] >= 1])}
-    return {"totals": totals, "time_split": time_split, "reuse_by_era": reuse_by_era, "gen_kinds": gen_kinds, "tools": fold(tool_rows),
+    links = ctxreport.report_links()
+    audits = [{"run": x["run"], "t0": x["t0"], "title": x["title"], "tag": x["tag"], "era": x["era"],
+               "report": links.get(x["run"]), **{k: x[k] for k in ("policy", "harness_revision", "read_max_lines", "read_max_chars")}, **{k: x["audit"][k] for k in contextaudit.FIELDS}} for x in rows]
+    return {"audit": contextaudit.aggregate(x["audit"] for x in rows), "audit_runs": audits, "totals": totals, "time_split": time_split, "reuse_by_era": reuse_by_era, "gen_kinds": gen_kinds, "tools": fold(tool_rows),
             "bash": fold(bash_rows), "bash_examples": dict(examples), "ctx_time": ctx_time, "ctx_mix": ctx_mix,
             "cats": [{"key": k, "name": n} for k, n in ctxreport.CATS], "growth": dict(growth), "one_two": one_two,
             "over_time": over_time, "tps_series": tps_series, "gpu": gpu, "dist": dist,
-            "runs": [{k: x[k] for k in ("t0", "tag", "era", "title", "result", "wall_s", "prefill_s", "gen_s", "tool_s",
+            "runs": [{k: x[k] for k in ("run", "policy", "harness_revision", "t0", "tag", "era", "title", "result", "wall_s", "prefill_s", "gen_s", "tool_s",
                                         "other_s", "requests", "gen_tok", "turns", "compactions", "peak", "window")} for x in rows]}
 
 
@@ -427,7 +436,7 @@ def write_csv(d):
     out = OUT / "study"
     out.mkdir(parents=True, exist_ok=True)
     tables = {"runs.csv": d["runs"], "tools.csv": d["tools"], "bash.csv": d["bash"], "generated.csv": d["gen_kinds"],
-              "time_split.csv": d["time_split"]}
+              "time_split.csv": d["time_split"], "context_audit.csv": d["audit_runs"]}
     for name, rows in tables.items():
         if rows:
             with open(out / name, "w", newline="") as f:
@@ -451,7 +460,7 @@ def main():
     OUT.mkdir(exist_ok=True)
     (OUT / "study.json").write_text(json.dumps(d))
     write_csv(d)
-    (OUT / "study.html").write_text(reportui.page("Loop study", d, TEMPLATE_JS))
+    (OUT / "study.html").write_text(reportui.page("Loop study", d, contextaudit.JS + TEMPLATE_JS))
     print(OUT / "study.html")
 
 
@@ -490,7 +499,7 @@ h+=card('2 · Where an agent\'s wall-clock time goes','Summed over all runs of e
  legend(tcols.map(c=>({n:c[0],c:c[2]})))+'<table><tr><th>Era</th>'+tcols.map(c=>`<th class="num">${esc(c[0].split(' (')[0])}</th>`).join('')+'</tr>'+
  TS.map(e=>`<tr><td>${esc(e.era)}</td>`+tcols.map(c=>`<td class="num">${pc(e[c[1]],e.wall_s)}</td>`).join('')+'</tr>').join('')+'</table>'+
  P(`<b>Reading it:</b> with the cache working, an agent spends about <b>${pc(TS[TS.length-1].gen_s,TS[TS.length-1].wall_s)} of its time waiting for the model to write</b>, ~${pc(TS[TS.length-1].prefill_s,TS[TS.length-1].wall_s)} for it to read, and only ~${pc(TS[TS.length-1].tool_s,TS[TS.length-1].wall_s)} actually running tools (tests, git, scripts). On Ollama, prompt reading was ${pc(TS[0].prefill_s,TS[0].wall_s)} and overhead ${pc(TS[0].other_s,TS[0].wall_s)} (retries, aborted streams, restarts).`,
- `<b>Implication:</b> the agent is <b>generation-bound</b>. Faster tools or a faster sandbox would barely matter; what matters is how many tokens the model writes per task (section 3) and how fast the GPUs write them. Prompt re-reading, the classic cost of long agent contexts, is solved by prefix caching — without it (day 1) it was the biggest avoidable cost.`));
+ `<b>Implication:</b> the agent is <b>generation-bound</b>. Faster tools or a faster sandbox would barely matter; what matters is how many tokens the model writes per task (section 3) and how fast the GPUs write them. Prefix caching greatly reduces prefill work; it does not remove context occupancy, compaction costs, or the risk of losing relevant evidence. These observations are not a controlled before/after experiment.`));
 
 // 3. generated tokens
 const GK=D.gen_kinds,gmax=Math.max(...GK.map(g=>g.tokens)),gtot=GK.reduce((a,g)=>a+g.tokens,0);
@@ -498,6 +507,10 @@ h+=card('3 · What the model spends its output on',`Every generated token by kin
  GK.filter(g=>g.tokens>1000).map(g=>`<div class="hb" style="grid-template-columns:minmax(0,1fr) 260px 150px" data-t="${esc(g.kind)}: ${k(g.tokens)} tokens"><span class="l">${esc(g.kind)}</span><span><div class="b" style="width:${100*g.tokens/gmax}%;background:${g.kind==='thinking'?col(5):g.kind.startsWith('call')?col(1):col(6)}"></div></span><span class="num">${k(g.tokens)} · ${pc(g.tokens,gtot)} · ${mins(g.gen_min)}</span></div>`).join('')+
  P(`<b>Thinking is ${pc((GK.find(g=>g.kind==='thinking')||{}).tokens||0,gtot)} of everything the model writes</b> — about ${mins((GK.find(g=>g.kind==='thinking')||{}).gen_min||0)} of pure GPU time. The tool calls themselves are next: Bash commands, then the file contents of Write and the old/new text of Edit. The replies a human would read are a few percent.`,
  `<b>Implication:</b> the cheapest speedup is less thinking per turn (reasoning budget, or a checklist step small enough that there is little to deliberate), not faster tools. Edit is a cheap way to change a file compared with Write, which regenerates it whole; Write's per-call cost is ${k((D.tools.find(t=>t.name==='Write')||{}).gen_tok/Math.max(1,(D.tools.find(t=>t.name==='Write')||{}).calls))} tokens vs ${k((D.tools.find(t=>t.name==='Edit')||{}).gen_tok/Math.max(1,(D.tools.find(t=>t.name==='Edit')||{}).calls))} for Edit.`));
+
+h+=contextAudit(D.audit);
+h+=card('Runs to inspect for large tool output','Sorted by oversized-result count, then result characters; compare like tasks and eras before drawing performance conclusions. <a href="study/context_audit.csv">Download context audit CSV</a>',
+ '<table><tr><th>Task / worker</th><th>Repeat chars</th><th>Large results</th><th>Errors</th></tr>'+[...D.audit_runs].sort((a,b)=>b.large_results-a.large_results||b.result_chars-a.result_chars).slice(0,15).map(r=>`<tr><td>${r.report?`<a href="${esc(r.report)}">${esc(r.title||r.run)}</a>`:esc(r.title||r.run)} · ${esc(r.tag)}</td><td>${k(r.repeat_chars)}</td><td>${r.large_results}</td><td>${r.errors}</td></tr>`).join('')+'</table>');
 
 // 4. tools
 const trow=t=>`<tr><td>${esc(t.name)}</td><td class="num">${t.calls}</td><td class="num">${k(t.gen_tok)}</td><td class="num">${mins(t.exec_s/60)}</td><td class="num">${f1(t.exec_s/Math.max(1,t.calls))} s</td><td class="num">${k(t.result_tok)}</td></tr>`;

@@ -212,6 +212,7 @@ def resolve(files, entry):
 
 
 def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
+    from taskcontract import GUIDE
     p = (ROOT / "prompts" / "loop.md").read_text().rstrip()
     if job.get("path"):
         from plan import Step, render
@@ -219,13 +220,8 @@ def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
               "why, not only at its checkbox; if the task as written would not serve it, say so in NOTES.md.\n"
               + render([Step(**s) for s in job["path"]]))
     if job.get("tid") and not job["parent"]:
-        p += (f"\n\n## Expand this ticket first\nBefore coding, write `state/tickets/{job['tid']}.md` (create the "
-              "directory if needed) — your terse spec for this ticket, in three short sections:\n"
-              "- `## Issue` — what is wrong or what is needed\n"
-              "- `## Done when` — the check or test that proves it is finished\n"
-              "- `## Plan` — the approach, a few short bullets\n"
-              "A few lines each, whole file under ~15 lines. It shows on the board and is your contract; keep it "
-              "truthful and update it if the plan changes. Then do the task.")
+        p += (f"\n\n## Expand this ticket first\nBefore coding, write `state/tickets/{job['tid']}.md` "
+              "(create the directory if needed). " + GUIDE)
     p += f"\n\n## Your task ({job['src']} line {job['line']})\n{job['task']}"
     if job["cl"] and not job["parent"]:
         p += (f"\n\nThis is a milestone line and {job['cl']} does not exist or has no open steps. Do what the "
@@ -253,7 +249,7 @@ def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
               + "\n".join(f"> {l}" for l in (resume.get("handoff") or "(none: the run could not write one)").splitlines())
               + "\nCheck what is there, then finish the task.")
     elif attempts > 1:
-        p += (f"\n\nThis is attempt {attempts} at this task; earlier attempts did not finish it. Read NOTES.md "
+        p += (f"\n\nThis is attempt {attempts} at this task; earlier attempts did not finish it. Use the NOTES.md snapshot "
               "for what was tried and why it failed, and try a different approach. Record this attempt's "
               "outcome in NOTES.md.")
 

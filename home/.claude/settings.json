@@ -12,6 +12,15 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /opt/agent/hooks/read_budget.py"
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {

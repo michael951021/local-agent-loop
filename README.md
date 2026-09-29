@@ -28,6 +28,13 @@ Full transcripts are in `logs/*.jsonl`. Each finished task gets a 3-line entry (
 blockers) appended to `projects/NAME/TASKLOG.md`; `projects/NAME/NOTES.md` is the rolling
 current-state handoff the next iteration reads, not a log.
 
+Read calls have configurable range budgets; long commands can save full evidence with
+`python3 /opt/agent/hooks/capture.py --log /work/.agent-evidence/test-1.log -- pytest -q`
+(gitignore `.agent-evidence/` first). The helper prints a bounded tail and preserves the exit code.
+Standup separates ready from waiting work and shows missing question/evidence/stop fields.
+Run reports and the study include a context audit and downloadable per-run metrics.
+See [the measured baseline, task examples, limitations and evaluation plan](docs/CONTEXT_STUDY.md).
+
 ## Layout
 
 | Path | What |

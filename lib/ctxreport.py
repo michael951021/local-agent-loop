@@ -24,6 +24,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import contextaudit
 import diffpage
 import phases
 import reportui
@@ -167,7 +168,7 @@ def analyse(events):
     tools = sorted(({"name": k, **v, "tokens": round(v["tokens"])} for k, v in tool_stats.items()),
                    key=lambda x: -x["tokens"])
     return {"calls": calls, "top": top, "tools": tools, "compactions": [c for c in compactions if c["turn"] is not None],
-            "retries": retries, "result": result, "t0": t_first, "t1": t_last}
+            "audit": contextaudit.analyse(events), "retries": retries, "result": result, "t0": t_first, "t1": t_last}
 
 
 # ── report ────────────────────────────────────────────────────────────────────
@@ -350,7 +351,7 @@ def build(log, sid, trigger, run=None):
         "cats": [{"key": k, "name": n} for k, n in CATS],
         "calls": [{"turn": c["turn"], "min": round((c["t"] - t0) / 60, 2) if c["t"] else None, "total": c["total"],
                    "delta": c["delta"], "comp": c["comp"], "added": c["added"]} for c in a["calls"]],
-        "final": last, "growth": growth, "top": a["top"], "tools": a["tools"],
+        "audit": a["audit"], "final": last, "growth": growth, "top": a["top"], "tools": a["tools"],
         "compactions": a["compactions"], "commits": cs, "share": share,
         "reqs": [{"min": round((r["t"] - t0) / 60, 2), **{k: r[k] for k in
                   ("prompt", "reused", "processed", "prefill_s", "gen", "gen_s", "tps", "full", "cancelled", "wall_s")}}
@@ -387,7 +388,7 @@ def build(log, sid, trigger, run=None):
     except Exception as e:   # never cost us the run report
         print(f"diff page: {e!r}", file=sys.stderr)
         data["diff"] = None
-    (out_dir / f"{name}.html").write_text(reportui.page(data["title"][:80], data, TEMPLATE_JS))
+    (out_dir / f"{name}.html").write_text(reportui.page(data["title"][:80], data, contextaudit.JS + TEMPLATE_JS))
     summary = {k: data[k] for k in ("title", "spec", "project", "worker", "tag", "start", "trigger", "merged", "result",
                                     "note", "attempt", "diff", "path", "closed")} | {
         "run": (start or {}).get("run"), "share_pct": share and share["mine_pct"]} | {
@@ -644,6 +645,8 @@ h+='<div class="grid2">'+card('Tools','Result tokens are what each tool added to
  '<table><tr><th>Tool</th><th class="num">Calls</th><th class="num">Tokens</th><th class="num">Per call</th></tr>'+
  D.tools.map(t=>`<tr><td>${esc(t.name)}</td><td class="num">${t.calls}</td><td class="num">${k(t.tokens)}</td><td class="num">${k(t.calls?t.tokens/t.calls:0)}</td></tr>`).join('')+'</table>')
  +card('Commits during the run',D.diff?`<a href="../${esc(D.diff.path)}">Full diff of this run →</a>`:D.commits.length?'':'none','<ul class="commits mono">'+D.commits.map(c=>`<li>${esc(c)}</li>`).join('')+'</ul>')+'</div>';
+
+h+=contextAudit(D.audit);
 
 h+=card('Per-turn data','','<details><summary>Turn-by-turn table ('+D.calls.length+' rows)</summary><div class="scroll"><table><tr><th class="num">Turn</th><th class="num" title="Minutes since the run started">Min into run</th><th class="num">Context</th><th class="num">Δ</th><th>Largest addition</th></tr>'+
  D.calls.map(c=>`<tr><td class="num">${c.turn}</td><td class="num">${f1(c.min)}</td><td class="num">${k(c.total)}</td><td class="num">${c.delta>=0?'+':''}${k(c.delta)}</td><td>${esc(c.added)}</td></tr>`).join('')+'</table></div></details>'+

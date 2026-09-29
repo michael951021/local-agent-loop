@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import plantree  # noqa: E402
 import reportui  # noqa: E402
+import taskcontract
 import sched  # noqa: E402
 from plan import Plan  # noqa: E402
 from telemetry import ROOT  # noqa: E402
@@ -36,21 +37,7 @@ def read_spec(proj_dir, tid):
     f = proj_dir / "state" / "tickets" / f"{tid}.md"
     if not f.is_file():
         return None
-    secs, cur, buf = {}, None, []
-    for line in f.read_text().splitlines():
-        h = HEAD.match(line)
-        if h:
-            if cur:
-                secs[cur] = "\n".join(buf).strip()
-            cur, buf = h.group(1).lower(), []
-        elif cur is not None:
-            buf.append(line)
-    if cur:
-        secs[cur] = "\n".join(buf).strip()
-    g = lambda *names: next((secs[n] for n in names if secs.get(n)), "")
-    spec = {"issue": g("issue"), "done_when": g("done when", "done-when", "done", "completion", "tests"),
-            "plan": g("plan", "solution plan", "solution")}
-    return spec if any(spec.values()) else {"issue": "\n".join(f.read_text().splitlines()[:15]).strip(), "done_when": "", "plan": ""}
+    return taskcontract.parse(f.read_text())
 
 
 def latest_reports(project):
@@ -133,6 +120,7 @@ def build_project(project):
             t.update(status="todo", substate=state,
                      blocker=sched.split_title(why)[0] if why and state in ("waiting", "blocked-failed") else "")
         t["expanded"] = expanded
+        t["contract_gaps"] = taskcontract.gaps(expanded)
         tickets.append(t)
 
     root = plan.root
@@ -141,6 +129,7 @@ def build_project(project):
     tree["done"] = sum(c["done"] for c in tree["children"])
     tree["tids"] = [x for c in tree["children"] for x in c["tids"]]
     return {"project": project, "goal": root.title, "why": root.why,
+            "activity": "claimed work" if claims else "past run reports" if reps else "no recorded runs",
             "initiatives": inits, "tickets": tickets, "tree": tree}
 
 
@@ -183,9 +172,9 @@ function tcard(t){
 function board(){
  const p=P[cur]; let tks=p.tickets;
  if(filt) tks=tks.filter(t=>filt.tids.has(t.tid));
- const cols=[['To Do','todo'],['In Progress','doing'],['Done','done']];
+ const cols=[['Ready','ready'],['In Progress','doing'],['Waiting / Blocked','waiting'],['Done','done']];
  return `<div class="cols">`+cols.map(([name,st])=>{
-   let list=tks.filter(t=>t.status===st);
+   let list=tks.filter(t=>st==='ready'?t.status==='todo'&&t.substate==='ready':st==='waiting'?t.status==='todo'&&t.substate!=='ready':t.status===st);
    if(st==='done') list=[...list].reverse();
    return `<div class="col"><div class="ch">${name} <span class="n">${list.length}</span></div>${list.map(tcard).join('')||'<div class="empty">–</div>'}</div>`}).join('')+`</div>`}
 
@@ -216,8 +205,9 @@ function drawer(t){
  h+=`<div class="note">${esc2(t.spec)}</div>`;
  if(t.status==='doing')h+=`<div class="pill">In progress · ${esc2(t.worker)}${t.step?' · '+esc2(t.step):''} · ${t.elapsed} min</div>`;
  if(t.status==='todo')h+=`<div class="pill">${t.substate==='waiting'?'Waiting on '+esc2(t.blocker):STATE[t.substate]||'ready'}</div>`;
- if(e){h+=sec('Issue',e.issue)+sec('Done when',e.done_when)+sec('Plan',e.plan)}
+ if(e){h+=sec('Issue',e.issue)+sec('Question',e.question)+sec('Evidence',e.evidence)+sec('Done when',e.done_when)+sec('Stop when',e.stop)+sec('Plan',e.plan)}
  else h+=`<div class="note" style="margin-top:10px">No spec yet — the agent writes state/tickets/${esc2(t.tid)}.md when it picks this up.</div>`;
+ if(t.status!=='done'&&t.contract_gaps.length)h+=sec('Contract fields to fill at pickup',t.contract_gaps.join(', '))+`<div class="note">Presence check only, not a quality score or scheduling gate. Ask: what observation would disprove the hypothesis, and what ends the investigation?</div>`;
  if(t.status==='done'){h+='<hr>';
   if(t.result)h+=`<div class="pill" style="color:var(--${t.result.cls||'muted'})">${esc2(t.result.label)}</div> <span class="note">${esc2(t.result.why)}</span>`;
   h+=sec('Post-mortem',t.summary)+sec("Agent's note",t.note);
@@ -230,8 +220,10 @@ function drawer(t){
 
 function render(){
  const p=P[cur];
+ if(!p){app.innerHTML='<h1>Standup</h1><p>No project plans found.</p>';return}
  let h=`<h1>Standup</h1><div class="sub">Tickets on the plan hierarchy: the goal, its colour-coded initiatives, and every ticket beneath one. Click a ticket for its spec, diff and post-mortem; click a block in the map to filter. · <a href="plan.html">plan &amp; time</a> · <a href="index.html">all reports</a></div>`;
- if(P.length>1)h+=`<div class="tabs">${P.map((q,i)=>`<button class="${i===cur?'on':''}" onclick="cur=${i};filt=null;render()">${esc2(q.project)}</button>`).join('')}</div>`;
+ if(P.length>1)h+=`<div class="tabs">${P.map((q,i)=>`<button class="${i===cur?'on':''}" onclick="cur=${i};filt=null;render()">${esc2(q.project)} · ${esc2(q.activity)}</button>`).join('')}</div>`;
+ h+=`<div class="note">${esc2(p.activity)}. Ready means dependency-eligible, not a promise of execution. Claimed work reflects scheduler state, not a worker heartbeat. ${p.tickets.filter(t=>t.status!=='done'&&t.contract_gaps.length).length} open tickets have incomplete contracts.</div>`;
  h+=`<div class="goal"><b>${esc2(p.goal)}</b>${p.why?`<div class="note">${esc2(p.why)}</div>`:''}</div>`;
  h+=`<div class="lg">${p.initiatives.map(it=>`<span class="ic" title="${esc2(it.why)}"><span class="sw" style="background:${icol(it.color)}"></span>${esc2(it.title)}</span>`).join('')}</div>`;
  h+=`<section class="card"><div class="note" style="margin:0 0 6px">Plan map — width = ticket count, colour = initiative. Click to filter the board; click the top bar to zoom out.${filt?` <b>Filtered: ${esc2(filt.label)}</b> <a href="#" onclick="filt=null;render();return false">clear</a>`:''}</div><div id="ice"></div></section>`;
@@ -243,7 +235,7 @@ function render(){
 document.head.insertAdjacentHTML('beforeend',`<style>
 .tabs{display:flex;gap:6px;margin:12px 0}.tabs button{font:inherit;background:var(--surface);border:1px solid var(--ring);color:var(--ink2);border-radius:7px;padding:4px 12px;cursor:pointer}.tabs button.on{color:var(--ink);border-color:var(--axis);font-weight:600}
 .goal{margin:14px 0 6px;font-size:15px}.lg{display:flex;flex-wrap:wrap;gap:4px 14px;margin:8px 0 4px;font-size:12px;color:var(--ink2)}.ic{display:inline-flex;align-items:center}
-.cols{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:8px;align-items:start}
+.cols{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:8px;align-items:start}
 @media(max-width:800px){.cols{grid-template-columns:1fr}}
 .col{background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:10px}
 .ch{font-weight:600;font-size:13px;margin:2px 4px 8px}.ch .n{color:var(--muted);font-weight:400}
