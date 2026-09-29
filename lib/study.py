@@ -413,7 +413,9 @@ def collect():
               "chars_per_token": round(cpt, 2), "med_tps": round(med_tps, 1) if med_tps else None,
               "from": time.strftime("%Y-%m-%d %H:%M", time.localtime(t_first)), "to": time.strftime("%Y-%m-%d %H:%M", time.localtime(t_last)),
               "built": time.strftime("%Y-%m-%d %H:%M")}
-    return {"totals": totals, "time_split": time_split, "gen_kinds": gen_kinds, "tools": fold(tool_rows),
+    rb = lambda qs: round(100 * sum(q["reused"] for q in qs) / max(1, sum(q["prompt"] for q in qs)), 1)
+    reuse_by_era = {"ollama": rb([q for q in reqs if q["era"] == 0]), "llama": rb([q for q in reqs if q["era"] >= 1])}
+    return {"totals": totals, "time_split": time_split, "reuse_by_era": reuse_by_era, "gen_kinds": gen_kinds, "tools": fold(tool_rows),
             "bash": fold(bash_rows), "bash_examples": dict(examples), "ctx_time": ctx_time, "ctx_mix": ctx_mix,
             "cats": [{"key": k, "name": n} for k, n in ctxreport.CATS], "growth": dict(growth), "one_two": one_two,
             "over_time": over_time, "tps_series": tps_series, "gpu": gpu, "dist": dist,
