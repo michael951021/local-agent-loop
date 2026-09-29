@@ -70,6 +70,13 @@ def key(text):
     return hashlib.sha1(text.strip().encode()).hexdigest()[:12]
 
 
+def ticket_id(text):
+    """Stable id for a TODO.md ticket: its (id: NAME) if it has one, else its content key. The ticket's
+    expanded spec lives at state/tickets/<ticket_id>.md, and the standup board keys tickets by this too."""
+    m = ID.search(text or "")
+    return m.group(1) if m else key(text)
+
+
 def alive(pid):
     try:
         os.kill(int(pid), 0)
@@ -211,6 +218,14 @@ def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
         p += ("\n\n## Where this fits\nEach level says how it serves the one above. Aim the work at your task's "
               "why, not only at its checkbox; if the task as written would not serve it, say so in NOTES.md.\n"
               + render([Step(**s) for s in job["path"]]))
+    if job.get("tid") and not job["parent"]:
+        p += (f"\n\n## Expand this ticket first\nBefore coding, write `state/tickets/{job['tid']}.md` (create the "
+              "directory if needed) — your terse spec for this ticket, in three short sections:\n"
+              "- `## Issue` — what is wrong or what is needed\n"
+              "- `## Done when` — the check or test that proves it is finished\n"
+              "- `## Plan` — the approach, a few short bullets\n"
+              "A few lines each, whole file under ~15 lines. It shows on the board and is your contract; keep it "
+              "truthful and update it if the plan changes. Then do the task.")
     p += f"\n\n## Your task ({job['src']} line {job['line']})\n{job['task']}"
     if job["cl"] and not job["parent"]:
         p += (f"\n\nThis is a milestone line and {job['cl']} does not exist or has no open steps. Do what the "
@@ -284,6 +299,7 @@ def cmd_next(st, worker, d, ref):
             attempts[akey] = n
             st.save("attempts.json", attempts)
             job["debrief"] = st.load("debriefs.json", {}).get(akey)
+            job["tid"] = ticket_id(entry["text"])
             job["path"] = where(files, job)
             if job["next"] is None:
                 i = todo_open.index(entry["text"])

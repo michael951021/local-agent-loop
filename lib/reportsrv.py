@@ -40,7 +40,7 @@ def refresh():
         return
     try:
         _last = time.time()
-        cmds = [["diffpage.py", "--live"], ["ctxreport.py", "--index"]]
+        cmds = [["diffpage.py", "--live"], ["ctxreport.py", "--index"], ["standup.py"]]
         study = REPORTS / "study.html"
         if not study.exists() or time.time() - study.stat().st_mtime > STUDY_EVERY:
             cmds.append(["study.py"])   # every run aggregated; ~10 s with its per-log cache

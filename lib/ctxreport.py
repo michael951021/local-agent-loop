@@ -521,6 +521,11 @@ def build_index():
         plantree.main()
     except Exception as e:   # nor the plan page
         print(f"plan page: {e!r}", file=sys.stderr)
+    try:
+        import standup
+        standup.main()
+    except Exception as e:   # nor the standup board
+        print(f"standup board: {e!r}", file=sys.stderr)
 
 
 def find_log(sid):
@@ -564,7 +569,7 @@ INDEX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  interrupted / split / merge fix), not whether the Claude session ended cleanly; when a task was not finished the
  agent's own note says why and what would have helped.
  Times are local (America/New_York); <b>Duration</b> is wall-clock time (h, min).
- · <a href="plan.html"><b>Plan</b></a>: the plan tree with time per section · <a href="study.html"><b>Study</b></a>: every run aggregated · <a href="fleet.html"><b>Fleet view</b></a>: every agent on one timeline, and how they share the GPUs</div>
+ · <a href="standup.html"><b>Standup</b></a>: the ticket board (To&nbsp;Do / In&nbsp;progress / Done) on the plan · <a href="plan.html"><b>Plan</b></a>: the plan tree with time per section · <a href="study.html"><b>Study</b></a>: every run aggregated · <a href="fleet.html"><b>Fleet view</b></a>: every agent on one timeline, and how they share the GPUs</div>
 <section class="card" style="overflow-x:auto"><table><tr><th title="Local time (America/New_York) the run started">Start (local)</th><th>Agent</th><th>Task</th><th>Attempt</th><th>Result</th><th class="num">Changes</th>
 <th class="num" title="Wall-clock length of the run, from the harness start line to its end line">Duration</th><th class="num" title="Model calls (API turns) in the run">Turns</th><th class="num" title="Largest prompt of the run, as % of the context window">Peak ctx</th><th class="num" title="Share of all context growth that was the model's own thinking">Thinking</th>
 <th class="num" title="Median generation speed of this run's model requests, tokens per second">Gen tok/s</th><th class="num" title="This run's share of busy GPU time while it ran">GPU share</th></tr>

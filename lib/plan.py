@@ -119,6 +119,16 @@ class Plan(BaseModel):
                 last = None if not isinstance(last, Section) else last
         return cls(root=root)
 
+    def initiatives(self) -> list[Section]:
+        """The top-level sections (## under the # goal). These are the plan's initiatives: each gets a
+        colour, and every ticket beneath one carries that colour on the board."""
+        return list(self.root.children)
+
+    def initiative_colors(self) -> dict[str, int]:
+        """{initiative title: colour slot}, by reading order, so the colours are distinct and stable while
+        the set of initiatives holds. A ticket's colour = its top-level ancestor's slot."""
+        return {s.title: i for i, s in enumerate(self.root.children)}
+
     def path(self, line: int) -> list[Step]:
         """Goal → sections → the task on LINE (empty if no task there)."""
         def go(sec, trail):

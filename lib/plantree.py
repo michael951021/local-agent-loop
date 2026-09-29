@@ -112,7 +112,7 @@ def main(argv=None):
 JS = r"""
 const hm=m=>{m=Math.round(m);return m<60?m+' min':Math.floor(m/60)+'h '+String(m%60).padStart(2,'0')+'m'};
 const kcol={milestone:col(1),task:col(2),section:col(0),goal:col(6),checklist:col(4)};
-let h=`<h1>Plan and time</h1><div class="sub">The plan hierarchy (goal → sections → milestones → checklist sections → tasks) with the wall-clock time agents spent under each part, from every run report. Width = time. Click a block to zoom in, click the top bar to zoom out. Grey = not worked on yet. · <a href="index.html">all reports</a> · <a href="study.html">study</a></div>`;
+let h=`<h1>Plan and time</h1><div class="sub">The plan hierarchy (goal → sections → milestones → checklist sections → tasks) with the wall-clock time agents spent under each part, from every run report. Width = time. Click a block to zoom in, click the top bar to zoom out. Grey = not worked on yet. · <a href="standup.html">standup board</a> · <a href="index.html">all reports</a> · <a href="study.html">study</a></div>`;
 D.trees.forEach((t,i)=>{h+=card(esc(t.title),`${hm(t.min)} over ${t.runs} runs${t.why?' · '+esc(t.why):''}`,`<div id="ice${i}"></div>`+
  legend([{n:'section',c:col(0)},{n:'milestone',c:col(1)},{n:'task',c:col(2)},{n:'not worked on',c:'var(--grid)'}]))+
  card('The tree','Every level with its time, runs and tasks done; ✓ = no open tasks left under it in TODO.md.',`<div id="tree${i}" class="mono" style="font-size:12.5px"></div>`)});
