@@ -113,7 +113,8 @@ def build_project(project):
         color = next((icol[s["title"]] for s in path if s["title"] in icol), None)
         crumb = [s for s in path if s["kind"] != "goal"]
         t = {"tid": tid, "title": title, "spec": spec, "crumb": crumb, "color": color,
-             "milestone": "(checklist:" in text, "expanded": read_spec(proj_dir, tid)}
+             "milestone": "(checklist:" in text}
+        expanded = read_spec(proj_dir, tid)
         if done:
             r = reps.get(title, {})
             t.update(status="done", result=r.get("result"), note=r.get("note"), summary=r.get("summary"),
@@ -121,13 +122,17 @@ def build_project(project):
                      when=r.get("start"), attempts=(r.get("attempt") or {}).get("n", 1))
         elif sched.key(text) in claims:
             c = claims[sched.key(text)]
+            worker = c.get("worker")
+            if worker and worker != "main":   # an in-progress spec lives on the agent's worktree, not merged yet
+                expanded = read_spec(ROOT / "work" / project / worker, tid) or expanded
             step = sched.split_title(c.get("task", ""))[0]
-            t.update(status="doing", worker=c.get("worker"), step=step if c.get("task") != text else "",
+            t.update(status="doing", worker=worker, step=step if c.get("task") != text else "",
                      elapsed=round((time.time() - c.get("since", time.time())) / 60))
         else:
             state, why = open_state.get(text, ("ready", ""))
             t.update(status="todo", substate=state,
                      blocker=sched.split_title(why)[0] if why and state in ("waiting", "blocked-failed") else "")
+        t["expanded"] = expanded
         tickets.append(t)
 
     root = plan.root
@@ -192,7 +197,7 @@ function icicle(host,tree){
   const dep=(function d(n){return 1+Math.max(0,...(n.children||[]).filter(c=>c.total>0).map(d))})(focus);
   const H=Math.min(dep,6)*RH+2,svg=el('svg',{viewBox:`0 0 ${W} ${H}`,height:H},host);
   const lay=(n,x0,x1,d)=>{if(d>=6||x1-x0<1)return;const w=x1-x0,y=d*RH,g=el('g',{},svg);
-   const c=n===tree?'var(--muted)':initColor(n);
+   const c=n===tree?'var(--muted)':icol(initColor(n));
    el('rect',{x:x0+.5,y:y+.5,width:Math.max(0,w-1),height:RH-2,rx:3,fill:c,'fill-opacity':n===tree?.25:Math.max(.2,.85-d*.16)},g);
    if(w>52){const tx=el('text',{x:x0+6,y:y+RH/2+4,style:`fill:${d?'#fff':'var(--ink)'};font-size:11px`},g);
     let s=n.title+(w>150?`  ·  ${n.done}/${n.total}`:'');const mx=Math.floor((w-10)/6.2);tx.textContent=s.length>mx?s.slice(0,mx-1)+'…':s}

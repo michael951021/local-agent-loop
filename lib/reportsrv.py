@@ -78,7 +78,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             return self.wfile.write(body)
         f = self.local(u.path)
-        if f and f.name in ("index.html", "fleet.html") and f.parent == REPORTS:
+        if f and f.name in ("index.html", "fleet.html", "standup.html") and f.parent == REPORTS:
             if time.time() - f.stat().st_mtime > REFRESH:
                 threading.Thread(target=refresh, daemon=True).start()
         if f and f.suffix == ".html" and f.is_file():
