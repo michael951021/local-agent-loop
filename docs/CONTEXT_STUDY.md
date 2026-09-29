@@ -43,6 +43,10 @@ neither missing framework code nor a promise that a worker will implement it.
 * SessionStart supplies a bounded NOTES snapshot and working-tree state, without
   unrelated TODO entries. Handoffs name evidence, exit codes, unresolved questions,
   and the next check. A new session or compaction can restore the snapshot.
+* SessionStart now includes a small repository inventory. Each task prompt adds
+  paths and Python declarations matching that task; `repo_map.py --query` refreshes
+  the map from the current worktree on demand. It omits source bodies and untracked ignored
+  files. This is a navigation hint: source search and tests remain necessary.
 * Contracts specify Issue, Question, Evidence, Done when, Stop when, and Plan.
   Agents stop or split after two attempts with no new evidence. This is a prompt
   rule, not a hard scheduler retry limit; existing configured limits still apply.
@@ -55,7 +59,10 @@ neither missing framework code nor a promise that a worker will implement it.
   contains counts, paths and turn numbers, not copied tool bodies or commands.
 * Newly started loop processes record their harness commit, context policy and
   Read budgets in run metadata, exported with `study/context_audit.csv`. A commit
-  is a revision identifier, not proof of an unchanged working tree.
+  is a revision identifier, not proof of an unchanged working tree. The map
+  version uses `bounded-map-v2`; workers started before this change may use the
+  new prompt code while retaining an older policy label, so treat those runs as
+  mixed rather than a clean comparison group.
 
 ## Better questions for this backlog
 
@@ -130,6 +137,11 @@ The full harness configuration takes effect when the loop is next started.
 4. **Question-aware scheduling.** A contract's headings can all exist while its
    question is still poor. Review high-cost or repeatedly blocked tasks for a
    falsifiable question and smaller scope before spending another long run.
+5. **Semantic navigation when needed.** The repository map handles paths and
+   Python declarations without a background process. It does not resolve types,
+   references or implementations. Add a language server only for projects and
+   tasks where those queries measurably cut search or mistakes; record server
+   startup, memory use and extra context before enabling it for every run.
 
 These are concrete gaps still open after this patch, not claims about proprietary
 lab systems. The public portfolio artifact here is the reproducible measurement

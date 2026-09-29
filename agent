@@ -455,7 +455,7 @@ cmd_worker() {
       --arg rev "$(git -C "$ROOT" rev-parse HEAD)" \
       --argjson readlines "${AGENT_READ_MAX_LINES:-240}" --argjson readchars "${AGENT_READ_MAX_CHARS:-16000}" \
       '{project: $p, worker: $w, workdir: $d, base: $b, branch: $br, agents: $n, num_parallel: $np, num_ctx: $ctx,
-        harness_revision: $rev, context_policy: "bounded-v1", read_max_lines: $readlines, read_max_chars: $readchars,
+        harness_revision: $rev, context_policy: "bounded-map-v2", read_max_lines: $readlines, read_max_chars: $readchars,
         task: .task, src: .src, parent: .parent, path: (.path // []), attempts: .attempts, merge_fix: ($c > 0), resumed: (.resumed // false)}' <<<"$j")"
     # hooks/task_done.py tells the agent to stop once this line is checked (merge-fix runs have no task).
     local src; src="$(jq -r '.src // "TODO.md"' <<<"$j")"

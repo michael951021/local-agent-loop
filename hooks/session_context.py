@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import subprocess
+from repo_map import inventory
 
 
 def snapshot(root):
@@ -21,6 +22,7 @@ def snapshot(root):
         parts += ["### NOTES.md snapshot (already in context)", text[:4000]]
         if len(text) > 4000:
             parts.append("[NOTES truncated at 4000 characters; search for omitted details only if needed.]")
+    parts += ["### Repository orientation", inventory(root)]
     # The harness supplies the assigned task in its prompt. Listing other open
     # tickets here encouraged redundant TODO reads and out-of-scope work.
     return "\n".join(parts)

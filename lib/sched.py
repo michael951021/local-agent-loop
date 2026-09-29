@@ -223,6 +223,16 @@ def prompt(files, job, attempts, step_abandon, others, resume=None, ref=None):
         p += (f"\n\n## Expand this ticket first\nBefore coding, write `state/tickets/{job['tid']}.md` "
               "(create the directory if needed). " + GUIDE)
     p += f"\n\n## Your task ({job['src']} line {job['line']})\n{job['task']}"
+    # The working tree matters here: a static cached map could name symbols
+    # already changed by another worker or by a resumed run.
+    try:
+        sys.path.insert(0, str(ROOT / "hooks"))
+        from repo_map import query
+        hints = query(files.d, job["task"] + " " + (job.get("parent") or ""))
+        if hints:
+            p += "\n\n## Repository hints\n" + hints
+    except (ImportError, OSError):
+        pass  # navigation hints must never prevent task assignment
     if job["cl"] and not job["parent"]:
         p += (f"\n\nThis is a milestone line and {job['cl']} does not exist or has no open steps. Do what the "
               "line says for that case. Check the milestone only when the line tells you to; after creating a "

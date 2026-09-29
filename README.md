@@ -35,6 +35,11 @@ Standup separates ready from waiting work and shows missing question/evidence/st
 Run reports and the study include a context audit and downloadable per-run metrics.
 See [the measured baseline, task examples, limitations and evaluation plan](docs/CONTEXT_STUDY.md).
 
+Task prompts also include a small repository map of matching paths and Python declarations.
+Query the current worktree again with `python3 /opt/agent/hooks/repo_map.py --query 'keywords'`;
+the map is rebuilt on request and excludes untracked ignored files. It is a navigation hint, so inspect
+the selected source and tests before changing behavior.
+
 ## Layout
 
 | Path | What |

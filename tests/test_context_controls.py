@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
+sys.path.insert(0, str(ROOT / "hooks"))
 import contextaudit
 import taskcontract
 import standup
@@ -29,6 +30,7 @@ def module(name, path):
 
 budget = module("read_budget", "hooks/read_budget.py")
 session = module("session_context", "hooks/session_context.py")
+repo_map = module("repo_map_test", "hooks/repo_map.py")
 
 
 class ContextControls(unittest.TestCase):
@@ -91,6 +93,29 @@ class ContextControls(unittest.TestCase):
         self.assertIn("NOTES truncated", text)
         self.assertNotIn("irrelevant backlog", text)
         self.assertLess(len(text), 7500)
+
+    def test_repo_map_matches_symbols_and_reflects_changes(self):
+        (self.root / "handler.py").write_text("def check_permission(user):\n    return True\n")
+        (self.root / "config.yaml").write_text("mode: strict\n")
+        (self.root / "dist").mkdir()
+        (self.root / "dist" / "old.py").write_text("def check_permission(): pass\n")
+        hit = repo_map.query(self.root, "permission", max_chars=400)
+        self.assertIn('"handler.py"', hit)
+        self.assertIn("check_permission:1", hit)
+        self.assertNotIn("dist/old.py", hit)
+        self.assertLessEqual(len(hit), 400)
+        (self.root / "handler.py").write_text("def check_owner(user):\n    return True\n")
+        self.assertNotIn("handler.py", repo_map.query(self.root, "permission"))
+        self.assertIn("check_owner:1", repo_map.query(self.root, "owner"))
+        self.assertIn("Top code areas", repo_map.inventory(self.root))
+
+    def test_repo_map_respects_git_ignores(self):
+        subprocess.run(["git", "init", "-q", self.root], check=True, capture_output=True)
+        (self.root / ".gitignore").write_text("generated/\n")
+        (self.root / "main.py").write_text("def run(): pass\n")
+        (self.root / "generated").mkdir()
+        (self.root / "generated" / "secret.py").write_text("def secret(): pass\n")
+        self.assertEqual(repo_map.files(self.root), ["main.py"])
 
 
 def exchange(tid, body="same", args=None, error=False, subagent=False):
@@ -162,6 +187,7 @@ class ContractTests(unittest.TestCase):
             spec = root / "state/tickets/t1.md"
             spec.parent.mkdir(parents=True)
             spec.write_text("## Question\nCan an invalid input bypass validation?\n## Stop when\nTwo attempts")
+            (root / "handler.py").write_text("def validate_input(value):\n    return value\n")
             self.assertEqual(standup.read_spec(root, "t1")["stop"], "Two attempts")
             job = dict(tid="t1", parent=None, src="TODO.md", line=1, task="Implement validation",
                        cl=None, next=[])
@@ -170,6 +196,8 @@ class ContractTests(unittest.TestCase):
             self.assertIn("## Question", prompt)
             self.assertIn("## Stop when", prompt)
             self.assertIn("capture.py", prompt)
+            self.assertIn("handler.py", prompt)
+            self.assertIn("validate_input:1", prompt)
             self.assertNotIn("Pipe long output through", prompt)
 
 

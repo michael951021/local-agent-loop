@@ -8,6 +8,9 @@ Context is limited. SessionStart supplies a bounded NOTES.md snapshot: use it in
 same file. Read CLAUDE.md and only the files needed for the assigned task. Locate symbols with `rg -n`,
 then Read small offset/limit ranges (start with 80 lines). Large Read requests are blocked by a hook;
 use a narrower range, not a whole-file shell read. Do not read TODO.md in full.
+The task prompt includes repository hints: they are paths and Python declarations, not source evidence.
+For another question or after edits, run `python3 /opt/agent/hooks/repo_map.py --query 'keywords'`.
+Follow a hint with `rg -n` and a small Read; do not read every mapped file.
 
 1. **Expand the ticket first** if the harness gives you a ticket-spec path. Follow the contract fields
    below: one question, starting evidence, a falsifiable check, scope and stopping condition, and plan.
