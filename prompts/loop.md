@@ -30,6 +30,9 @@ Follow a hint with `rg -n` and a small Read; do not read every mapped file.
    Implement the task. After two attempts without new evidence, stop and record what is missing, or split
    the task. Repeating a failing command or speculation is not progress. Investigations may conclude that
    behavior is intended; preserve the evidence instead of inventing a fix to satisfy a checkbox.
+   This run is headless: ending your turn ends the session and kills any background job. Never end a turn to
+   "wait for a notification". For a long job, run it in the foreground under capture.py with a long enough
+   `--timeout`, or start it in the background and poll it with `sleep N; tail LOG` until it exits.
 3. Prove it works with the smallest relevant test, then required checks. Preserve long output with:
    `python3 /opt/agent/hooks/capture.py --log /work/.agent-evidence/<unique-name>.log --timeout 300 -- <command>`
    Ensure `.agent-evidence/` is gitignored before using it. This prints a bounded tail and returns the command's actual exit code. Search the saved log for earlier
