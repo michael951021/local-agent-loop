@@ -8,8 +8,8 @@ Does what loop.md asks, instantly and without a model, driven by markers in the 
   [partial P]   write P before sleeping, so an interrupted run leaves work behind
 Resumed with the handoff prompt, it prints a 2-line note; a run that continues an interrupted task
 skips its sleep and records "resumed" in shared/seen.
-It checks the task's box, rewrites NOTES.md, appends to TASKLOG.md and commits, and prints a
-plausible stream-json transcript. Given the merge-conflict prompt, it merges and keeps both sides.
+It rewrites NOTES.md, commits and ends with a RESULT block (the harness checks the box and writes TASKLOG.md);
+a [fail] run ends without one and, asked for it, answers "not done". It prints a plausible stream-json transcript. Given the merge-conflict prompt, it merges and keeps both sides.
 """
 import json
 import os
@@ -35,6 +35,11 @@ def msg(n, text, tokens):
                                     "content": [{"type": "thinking", "thinking": "x" * 400}, {"type": "text", "text": text}]})
 
 
+if "--resume" in sys.argv and "without the RESULT block" in prompt:
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result":
+                      "RESULT: not done\nSUMMARY: nothing\nWHY: Blocked: the fake task is marked [fail].\n"
+                      "NEEDED: Would have helped: a task without [fail]."}))
+    sys.exit(0)
 if "--resume" in sys.argv and "without finishing your task" in prompt:
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result":
                       "Blocked: the fake task is marked [fail].\nWould have helped: a task without [fail]."}))
@@ -75,19 +80,16 @@ else:
         if f:
             os.makedirs(os.path.dirname(f.group(1)) or ".", exist_ok=True)
             open(f.group(1), "w").write(task.split(":")[0] + "\n")
-        lines = open(src).read().split("\n")
-        lines[line - 1] = lines[line - 1].replace("- [ ]", "- [x]", 1)
-        open(src, "w").write("\n".join(lines))
         name = task.split(":")[0]
         open("NOTES.md", "w").write(f"# Notes\nlast task: {name}\nworker: {os.environ.get('AGENT_WORKER')}\n")
-        with open("TASKLOG.md", "a") as log:
-            log.write(f"- {name}\n  - Goal: {name}\n  - Approach: fake\n  - Blockers: none\n")
         if os.path.isdir("shared"):   # the .agent-shared directory, visible to every agent
             with open("shared/seen", "a") as s:
                 s.write(f"{os.environ.get('AGENT_WORKER')} {name}\n")
         git("add", "-A")
         git("commit", "-q", "-m", f"fake: {name}")
         note = f"done: {name}"
+        final = f"RESULT: done\nSUMMARY: did {name}\nAPPROACH: fake\nBLOCKERS: none"
 
 msg(2, note, 17000)
-emit(duration_ms=1000, is_error=False, num_turns=2, subtype="success", type="result")   # Claude Code puts "type" late
+extra = {"result": final} if "final" in globals() else {}
+emit(duration_ms=1000, is_error=False, num_turns=2, subtype="success", type="result", **extra)   # Claude Code puts "type" late

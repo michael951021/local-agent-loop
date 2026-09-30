@@ -258,19 +258,21 @@ HANDOFF_PROMPT="$(cat "$ROOT/prompts/handoff.md")"
 # A run that ends normally with its task still unchecked and no RESULT block in its final message is
 # asked why (shown in reports, and given to the next attempt). See phases.py: this is a fallback.
 DEBRIEF_PROMPT="$(cat "$ROOT/prompts/debrief.md")"
+RESULT_PROMPT="$(cat "$ROOT/prompts/result.md")"
 
-handoff() {   # DIR SID [PROMPT] → the note on stdout (empty if the session cannot be resumed)
+handoff() {   # DIR SID [PROMPT] [LINES] → the note on stdout (empty if the session cannot be resumed)
   [[ -n "$2" && "$2" != null ]] || return 0
   sandbox "$1" -- timeout 20m claude -p "${3:-$HANDOFF_PROMPT}" --resume "$2" --tools "" --max-turns 1 \
       --output-format json "${claude_args[@]}" </dev/null 2>/dev/null |
     jq -r '.result // empty' 2>/dev/null |
     python3 -c 'import sys
-lines = [l.strip() for l in sys.stdin.read().splitlines() if l.strip()][:2]
-words, out = 80, []
+n = int(sys.argv[1])
+lines = [l.strip() for l in sys.stdin.read().splitlines() if l.strip()][:n]
+words, out = 40 * n, []
 for l in lines:
     w = l.split()[:words]; words -= len(w)
     if w: out.append(" ".join(w))
-print("\n".join(out))' || true
+print("\n".join(out))' "${4:-2}" || true
 }
 
 final_field() {   # NAME TEXT → the value of "NAME: ..." in a final message's RESULT block
@@ -472,6 +474,19 @@ cmd_worker() {
     if ((was_fix)); then state="merge-fix"
     elif ((checked)); then state="done"
     elif ! grep -qF -- "- [ ] $task" "$wt/$src" 2>/dev/null; then state="split"
+    fi
+    # Close-out is the harness's job (prompts/loop.md step 4): a RESULT of done checks the line and writes
+    # the TASKLOG entry. A final message without a RESULT block (often lost to a compaction) is asked for
+    # it once. Milestone lines (checklist: PATH) are checked only by the agent, when the line says so.
+    local milestone=0
+    [[ -n "$(jq -r '.cl // empty' <<<"$j")" && -z "$(jq -r '.parent // empty' <<<"$j")" ]] && milestone=1
+    if ((! was_fix && ! milestone)) && [[ -n "$session" && ( "$state" == open || "$state" == done ) ]]; then
+      if [[ "$state" == open && -z "$(final_field RESULT "$final")" ]]; then
+        echo -e "\033[2mno RESULT block — asking the agent for it\033[0m"
+        final="$(handoff "$wt" "$sid" "$RESULT_PROMPT" 6)"
+      fi
+      python3 "$ROOT/lib/closeout.py" "$wt" "$src" "$task" "$base" "$final" 2>&1 | sed 's/^/  close-out: /' || true
+      grep -qiF -- "- [x] $task" "$wt/$src" 2>/dev/null && { checked=1; state="done"; }
     fi
     # Cut off before its task was checked: pause it (handoff, same agent continues). Cut off after (it ran
     # on past its task) counts as finished.

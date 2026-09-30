@@ -15,7 +15,19 @@ Follow a hint with `rg -n` and a small Read; do not read every mapped file.
 1. **Expand the ticket first** if the harness gives you a ticket-spec path. Follow the contract fields
    below: one question, starting evidence, a falsifiable check, scope and stopping condition, and plan.
    For checklist steps, use those same criteria for the assigned step; do not rewrite the whole milestone.
-2. Implement the task. After two attempts without new evidence, stop and record what is missing, or split
+2. **Acceptance check first.** Before implementing, turn the ticket's `Done when` into a test or script in
+   the repo and run it on the real inputs it names (real checkpoint, real data, not a toy stand-in), so it
+   fails for the reason you expect. Debug from that check. Write a throwaway probe only to localize a failure
+   the check shows; when a probe and the check disagree, suspect the probe first.
+   **Numbers are claims.** If the task produces a measured number (a metric, rate, loss, speedup, benchmark):
+   - include at least one known-answer check on the real pipeline: an input whose value is known without your
+     code, e.g. a hand-computed case, an independent reference (the library's own loss or generate), a planted
+     effect the pipeline must recover, a null control that must show none, or a published value;
+   - before reporting, compare the result with earlier related numbers (NOTES.md, results/) and a plausible
+     range written down before the run. Off by more than 5x or outside the range means a bug until a
+     measurement rules it out. An explanation ("different definitions") is a hypothesis to test, not a finding;
+   - report the known-answer checks next to the number.
+   Implement the task. After two attempts without new evidence, stop and record what is missing, or split
    the task. Repeating a failing command or speculation is not progress. Investigations may conclude that
    behavior is intended; preserve the evidence instead of inventing a fix to satisfy a checkbox.
 3. Prove it works with the smallest relevant test, then required checks. Preserve long output with:
@@ -23,26 +35,24 @@ Follow a hint with `rg -n` and a small Read; do not read every mapped file.
    Ensure `.agent-evidence/` is gitignored before using it. This prints a bounded tail and returns the command's actual exit code. Search the saved log for earlier
    failures. Never infer success from a tail pipeline's exit code. Keep evidence paths and the test result
    in the handoff; do not paste full logs or commit generated evidence unless the task requires it.
-4. Change that task's line from `- [ ]` to `- [x]` in the file named in the task header (TODO.md or a checklist).
-   Edit only that line, and leave its `(id: ...)` / `(after: ...)` tags as they are (the scheduler reads them).
-   If the step failed and you took a checklist's On failure path instead, leave it.
-   Exception: a TODO.md milestone line ending in `(checklist: PATH)` is checked only when the line itself says so.
+4. Do not check your task's line or write TASKLOG.md: when your RESULT block says done, the harness checks the
+   line and appends the TASKLOG entry from that block. Exceptions: a TODO.md milestone line ending in
+   `(checklist: PATH)` you check yourself, only when the line says so; after splitting a task, check the new
+   line you finished yourself.
 5. Update NOTES.md. It is a short current-state summary, not a log: keep it under 4 KB and ~60 lines.
    Rewrite or delete outdated lines instead of appending. Keep only what later runs need:
    question answered or still open, decisions and supporting evidence paths, commands with exit codes,
    file locations, gotchas, and the next discriminating check. Separate observations from hypotheses. If it is over 4 KB now, condense it first
    (merging parallel work can leave two versions of a line: keep the true one).
-6. Append an entry to TASKLOG.md (create it with a one-line header if it doesn't exist yet). Unlike NOTES.md,
-   this is a permanent record — never edit or delete earlier entries, only append. Exactly 3 lines for this task:
-   - Goal: what this task was trying to accomplish
-   - Approach: how you did it
-   - Blockers: any big blocker hit (looping/retrying, missing context, flaky tests, tooling gaps), or "none"
+6. (TASKLOG.md is written by the harness; never edit earlier entries.)
 7. git commit with a message describing the task.
 8. End the run with this final message and nothing after it (the harness reads it; it is the only report of
    how the run went, so make it true, not hopeful):
    ```
    RESULT: done | not done
    SUMMARY: one line: what changed and how it works
+   APPROACH: done only: one line: how you did it
+   BLOCKERS: done only: the biggest blocker hit (looping, missing context, flaky tests, tooling gaps), or none
    WHY: not done only: the actual blocker
    NEEDED: not done only: what would most have helped (a tool, access, data, context, or a smaller task)
    ```
