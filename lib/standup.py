@@ -172,7 +172,7 @@ function tcard(t){
 function board(){
  const p=P[cur]; let tks=p.tickets;
  if(filt) tks=tks.filter(t=>filt.tids.has(t.tid));
- const cols=[['Ready','ready'],['In Progress','doing'],['Waiting / Blocked','waiting'],['Done','done']];
+ const cols=[['Waiting / Blocked','waiting'],['Ready','ready'],['In Progress','doing'],['Done','done']];
  return `<div class="cols">`+cols.map(([name,st])=>{
    let list=tks.filter(t=>st==='ready'?t.status==='todo'&&t.substate==='ready':st==='waiting'?t.status==='todo'&&t.substate!=='ready':t.status===st);
    if(st==='done') list=[...list].reverse();
