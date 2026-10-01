@@ -647,7 +647,8 @@ ab_sandbox_setup() {
   done < <(jq -r '.env // {} | to_entries[] | "\(.key)\t\(.value)"' "$spec")
 }
 
-cmd_abrun() {   # _abrun SPEC — one trial: claude -p in the trial's worktree, stream-json to SPEC.log
+cmd_abrun() {   # _abrun SPEC — one trial: claude -p in the trial's worktree, stream-json appended to SPEC.log
+                # (.resume = a session id: continue that session with .prompt, e.g. phase-2 feedback)
   local spec="$1"; check_ollama
   local SB_BINDS=() SB_ENV=() SB_KA=() SB_TAG SB_WORKER
   ab_sandbox_setup "$spec"
@@ -655,6 +656,8 @@ cmd_abrun() {   # _abrun SPEC — one trial: claude -p in the trial's worktree, 
   wt="$(jq -r .workdir "$spec")"; log="$(jq -r .log "$spec")"; rid="$(jq -r .run "$spec")"
   sysf="$(jq -r '.system // empty' "$spec")"
   if [[ -n "$sysf" ]]; then SB_BINDS+=(--ro-bind "$sysf" /opt/agent/ab-system.md); args=(--append-system-prompt-file /opt/agent/ab-system.md); fi
+  local sid; sid="$(jq -r '.resume // empty' "$spec")"; [[ -n "$sid" ]] && args+=(--resume "$sid")
+  local t; while read -r t; do [[ -n "$t" ]] && args+=(--disallowedTools "$t"); done < <(jq -r '.disallowed_tools[]?' "$spec")
   sandbox "$wt" -- timeout --kill-after=60 "$ITER_TIMEOUT" claude -p "$(jq -r .prompt "$spec")" "${args[@]}" \
     --dangerously-skip-permissions --max-turns "$MAX_TURNS" --output-format stream-json --verbose \
     < /dev/null | tee -a "$log" | AGENT_RUN="$rid" python3 "$ROOT/lib/pretty.py"

@@ -11,6 +11,12 @@ and a blind pairwise judge.
   ./agent ab judge  EXP [--samples K]   blind pairwise verdicts by Claude (`claude -p`, both orders, cached)
   ./agent ab report EXP                 reports/ab/EXP.html + one page per trial (also rebuilt after each trial)
   ./agent ab clean  EXP                 remove the trials' worktrees (branches ab/EXP/* keep every diff)
+  ./agent ab import polyglot-python EXP [--repeats N]   a public benchmark as an experiment (lib/abbench.py)
+
+Variant `verify = {rounds, runs, feedback}`: after the agent stops, the task's check runs `runs` times in a
+fresh checkout of its committed work ("phase 2"); on failure the same session is resumed with the output
+(feedback "check") or a bare "not accepted yet" (feedback "generic", the control), up to `rounds` times.
+Every trial runs phase 2 once as a shadow, so the rate of false "done"s is measured for every variant.
 
 Reproducibility: the first run pins the base commit, harness revision and model-server config into
 ab/EXP/pinned.json. Each trial records the hash of its task + variant; editing either marks that trial
@@ -44,6 +50,7 @@ ROOT = Path(__file__).resolve().parent.parent
 AB, RUN, LOGS, REPORTS = ROOT / "ab", ROOT / "run" / "ab", ROOT / "logs" / "ab", ROOT / "reports" / "ab"
 WORK = ROOT / "work" / "ab"
 POLL = 20
+GITLOCK = threading.Lock()   # parallel trials add/remove worktrees of one repo
 ENV_KNOBS = {"NUM_CTX", "CTX_MARGIN", "MAX_TURNS", "ITER_TIMEOUT", "AGENT_READ_MAX_LINES", "AGENT_READ_MAX_CHARS"}
 BOOKKEEPING = sorted(diffpage.BOOKKEEPING)
 JUDGE_MODEL = "claude-opus-5-5"
@@ -198,7 +205,8 @@ class Exp:
 
     def key(self, tid, vname):
         return h({"task": self.tasks[tid], "variant": self.variants[vname],
-                  "global": {k: self.spec.get(k) for k in ("timeout", "max_turns", "shared", "copy")}})
+                  "global": {k: self.spec.get(k) for k in ("timeout", "max_turns", "shared", "copy", "disallowed_tools",
+                                                           "verify_runs")}})
 
     def order(self):
         """Every (task, variant, rep), interleaved: rep-major, tasks in spec order, variants shuffled per cell."""
@@ -249,6 +257,15 @@ def setup_tree(exp, task, variant, rep, pin):
     tid = exp.tid(task, variant, rep)
     wt, branch = WORK / exp.name / tid, f"ab/{exp.name}/{tid}"
     p = str(exp.pdir)
+    GITLOCK.acquire()
+    try:
+        _fresh_tree(p, wt, branch, pin)
+    finally:
+        GITLOCK.release()
+    return _apply_variant(exp, variant, wt)
+
+
+def _fresh_tree(p, wt, branch, pin):
     if wt.exists():
         sh("git", "-C", p, "worktree", "remove", "--force", str(wt), check=False)
         shutil.rmtree(wt, ignore_errors=True)
@@ -256,6 +273,9 @@ def setup_tree(exp, task, variant, rep, pin):
     sh("git", "-C", p, "branch", "-D", branch, check=False)
     wt.parent.mkdir(parents=True, exist_ok=True)
     sh("git", "-C", p, "worktree", "add", "-q", "-b", branch, str(wt), pin["base"])
+
+
+def _apply_variant(exp, variant, wt):
     v = exp.variants[variant]
     for dst, src in v.get("files", {}).items():
         (wt / dst).parent.mkdir(parents=True, exist_ok=True)
@@ -301,8 +321,10 @@ def prompt_for(exp, task, variant):
 
 
 def log_metrics(log):
-    """From the stream-json log: the result event's numbers, tool calls, and the final message."""
-    m = {"tools": 0, "tool_counts": {}, "final": "", "result_event": False}
+    """From the stream-json log (every round of the trial): summed result-event numbers, tool calls, the final
+    message and the latest session id (what a feedback round resumes)."""
+    m = {"tools": 0, "tool_counts": {}, "final": "", "result_events": 0, "turns": 0, "duration_ms": 0,
+         "input_tokens": 0, "output_tokens": 0, "session": None}
     try:
         lines = Path(log).read_text(errors="replace").splitlines()
     except OSError:
@@ -312,7 +334,9 @@ def log_metrics(log):
             ev = json.loads(line)
         except ValueError:
             continue
-        if ev.get("type") == "assistant":
+        if ev.get("type") == "system" and ev.get("subtype") == "init":
+            m["session"] = ev.get("session_id")
+        elif ev.get("type") == "assistant":
             for b in ev.get("message", {}).get("content", []) or []:
                 if b.get("type") == "tool_use":
                     m["tools"] += 1
@@ -321,17 +345,65 @@ def log_metrics(log):
                     m["final"] = b["text"]
         elif ev.get("type") == "result":
             u = ev.get("usage") or {}
-            m.update(result_event=True, subtype=ev.get("subtype"), is_error=ev.get("is_error"),
-                     turns=ev.get("num_turns"), duration_ms=ev.get("duration_ms"),
-                     input_tokens=(u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
-                     + (u.get("cache_creation_input_tokens") or 0),
-                     output_tokens=u.get("output_tokens"))
+            m["result_events"] += 1
+            m.update(subtype=ev.get("subtype"), is_error=ev.get("is_error"))
+            m["turns"] += ev.get("num_turns") or 0
+            m["duration_ms"] += ev.get("duration_ms") or 0
+            m["input_tokens"] += sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens",
+                                                             "cache_creation_input_tokens"))
+            m["output_tokens"] += u.get("output_tokens") or 0
             if ev.get("result"):
                 m["final"] = ev["result"]
     return m
 
 
+def commit_all(wt, msg):
+    if sh("git", "-C", str(wt), "status", "--porcelain").strip():
+        sh("git", "-C", str(wt), "add", "-A")
+        sh("git", "-C", str(wt), "-c", "user.name=agent", "-c", "user.email=agent@sandbox", "commit", "-q", "-m", msg)
+    return sh("git", "-C", str(wt), "rev-parse", "HEAD").strip()
+
+
+def checked(exp, td, spec, head, cmd, hidden=None, name="check", runs=1):
+    """Run CMD (sandboxed) `runs` times in a fresh checkout of HEAD: committed files only, so nothing the agent
+    left uncommitted or gitignored counts. HIDDEN files are copied in first. Returns (all passed, output)."""
+    fresh = WORK / exp.name / f"{td.name}.{name}"
+    with GITLOCK:
+        sh("git", "-C", str(exp.pdir), "worktree", "remove", "--force", str(fresh), check=False)
+        shutil.rmtree(fresh, ignore_errors=True)
+        sh("git", "-C", str(exp.pdir), "worktree", "add", "-q", "--detach", str(fresh), head)
+    try:
+        if hidden:
+            shutil.copytree(ROOT / hidden, fresh, dirs_exist_ok=True)
+        cs = td / f"{name}.spec.json"
+        jsave(cs, {**spec, "workdir": str(fresh), "check": cmd})
+        out, ok = [], True
+        for i in range(runs):
+            r = subprocess.run([str(ROOT / "agent"), "_abcheck", str(cs)], capture_output=True, text=True, errors="replace")
+            out.append(f"── run {i + 1}: exit {r.returncode}\n{r.stdout}{r.stderr}")
+            ok = ok and r.returncode == 0
+        return ok, "\n".join(out)
+    finally:
+        with GITLOCK:
+            sh("git", "-C", str(exp.pdir), "worktree", "remove", "--force", str(fresh), check=False)
+            shutil.rmtree(fresh, ignore_errors=True)
+
+
+FEEDBACK = {
+    "check": ("An independent re-run of the acceptance check failed, so the task is not done yet.\n"
+              "Check: `{cmd}`, run {runs}x in a fresh checkout of your committed work (uncommitted or gitignored "
+              "files do not exist there).\nOutput (last {n} lines):\n```\n{out}\n```\n"
+              "Fix the cause, run the check yourself, and commit. Do not change the tests to make them pass."),
+    "generic": ("Your work was not accepted yet. Re-check that the task is completely and correctly done, "
+                "fix anything that is not, and commit."),
+}
+
+
 def run_trial(exp, task, variant, rep, pin, contention):
+    """One trial. Round 0: the agent works on the task. Then, for every variant, a shadow phase-2 check (the
+    task's own check, `runs` times, fresh checkout) records whether the agent's "done" holds up. Variants with
+    `verify` get feedback rounds while phase 2 fails (resuming the same session). Grading = the hidden check
+    on the final commit; `passed_initial` = the hidden check on round 0's commit (same trial, before feedback)."""
     tid = exp.tid(task, variant, rep)
     td = exp.trials_d / tid
     shutil.rmtree(td, ignore_errors=True)
@@ -339,12 +411,12 @@ def run_trial(exp, task, variant, rep, pin, contention):
     (RUN / exp.name).mkdir(parents=True, exist_ok=True)
     pidf = RUN / exp.name / f"{tid}.pid"
     t0 = time.time()
+    t = exp.tasks[task]
     res = {"id": tid, "task": task, "variant": variant, "rep": rep, "key": exp.key(task, variant), "base": pin["base"],
-           "harness": sh("git", "-C", str(ROOT), "rev-parse", "HEAD").strip(), "started": t0}
+           "harness": sh("git", "-C", str(ROOT), "rev-parse", "HEAD").strip(), "started": t0, "rounds": 0}
     try:
         wt, setup = setup_tree(exp, task, variant, rep, pin)
         v = exp.variants[variant]
-        LOGS.mkdir(parents=True, exist_ok=True)
         log = LOGS / exp.name / f"{tid}.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.unlink(missing_ok=True)
@@ -354,34 +426,52 @@ def run_trial(exp, task, variant, rep, pin, contention):
                 "run": f"ab-{exp.name}-{tid}", "tag": f"ab/{exp.name}/{tid}", "worker": f"ab-{variant}",
                 "binds": binds(exp, wt), "env": env, "sampling": v.get("sampling", {}),
                 "system": str(ROOT / v["system"]) if v.get("system") else None,
-                "check": exp.tasks[task].get("check", "true"), "check_timeout": exp.tasks[task].get("check_timeout", 900)}
-        jsave(td / "spec.json", spec)
+                "disallowed_tools": exp.spec.get("disallowed_tools", []),
+                "check": t.get("check", "true"), "check_timeout": t.get("check_timeout", 900)}
         res.update(setup=setup, prompt=spec["prompt"], env=env, sampling=spec["sampling"], log=str(log))
-        with open(td / "console.txt", "w") as con:
-            p = subprocess.Popen([str(ROOT / "agent"), "_abrun", str(td / "spec.json")], stdout=con, stderr=subprocess.STDOUT)
-            pidf.write_text(str(p.pid))
-            rc = p.wait()
-        res["wall_s"] = round(time.time() - t0, 1)
+
+        def agent_round(rspec, n):
+            jsave(td / f"round{n}.spec.json", rspec)
+            with open(td / "console.txt", "a") as con:
+                con.write(f"\n━━ round {n} ━━\n")
+                con.flush()
+                p = subprocess.Popen([str(ROOT / "agent"), "_abrun", str(td / f"round{n}.spec.json")],
+                                     stdout=con, stderr=subprocess.STDOUT)
+                pidf.write_text(str(p.pid))
+                return p.wait()
+
+        rc = agent_round(spec, 0)
         res["run_rc"] = rc
-        if sh("git", "-C", str(wt), "status", "--porcelain").strip():
-            sh("git", "-C", str(wt), "add", "-A")
-            sh("git", "-C", str(wt), "-c", "user.name=agent", "-c", "user.email=agent@sandbox", "commit", "-q",
-               "-m", "ab: leftover changes")
-        head = sh("git", "-C", str(wt), "rev-parse", "HEAD").strip()
+        head = commit_all(wt, "ab: leftover changes")
+        res["head_initial"] = head
+        res["passed_initial"], _ = checked(exp, td, spec, head, spec["check"], t.get("hidden"), "grade0")
+        vf = v.get("verify") or {}
+        vcmd, runs = t.get("verify_check", spec["check"]), int(vf.get("runs", exp.spec.get("verify_runs", 2)))
+        ok, out = checked(exp, td, spec, head, vcmd, None, "phase2", runs)
+        res["phase2_first"] = ok
+        (td / "phase2.txt").write_text(f"round 0: {'pass' if ok else 'FAIL'}\n{out}\n")
+        while vf and not ok and res["rounds"] < int(vf.get("rounds", 2)):
+            res["rounds"] += 1
+            sid = log_metrics(log)["session"]
+            tail = "\n".join(out.splitlines()[-80:])
+            msg = FEEDBACK[vf.get("feedback", "check")].format(cmd=vcmd, runs=runs, n=80, out=tail)
+            rc = agent_round({**spec, "prompt": msg, "resume": sid}, res["rounds"])
+            head = commit_all(wt, f"ab: leftover changes (round {res['rounds']})")
+            ok, out = checked(exp, td, spec, head, vcmd, None, "phase2", runs)
+            with open(td / "phase2.txt", "a") as f:
+                f.write(f"round {res['rounds']}: {'pass' if ok else 'FAIL'}\n{out}\n")
+        res["phase2_final"] = ok
+        res["wall_s"] = round(time.time() - t0, 1)
         excl = [f":(exclude){b}" for b in BOOKKEEPING]
         stat = sh("git", "-C", str(wt), "diff", "--numstat", setup, head, "--", ".", *excl)
         res.update(head=head, files=len(stat.splitlines()),
                    add=sum(int(a) for a, *_ in (l.split("\t") for l in stat.splitlines()) if a.isdigit()),
                    dele=sum(int(b) for _, b, *_ in (l.split("\t") for l in stat.splitlines()) if b.isdigit()))
-        res.update(log_metrics(log))
-        hidden = exp.tasks[task].get("hidden")
-        if hidden:
-            shutil.copytree(ROOT / hidden, wt, dirs_exist_ok=True)
+        res.update({k: x for k, x in log_metrics(log).items() if k != "session"})
         c0 = time.time()
-        chk = subprocess.run([str(ROOT / "agent"), "_abcheck", str(td / "spec.json")], capture_output=True, text=True,
-                             errors="replace")
-        (td / "check.txt").write_text(chk.stdout + chk.stderr)
-        res.update(check_rc=chk.returncode, passed=chk.returncode == 0, check_s=round(time.time() - c0, 1))
+        ok, out = checked(exp, td, spec, head, spec["check"], t.get("hidden"), "grade")
+        (td / "check.txt").write_text(out)
+        res.update(passed=ok, check_rc=0 if ok else 1, check_s=round(time.time() - c0, 1))
         res["timed_out"] = rc in (124, 137) or res.get("subtype") == "error_max_turns"
     except Exception as e:   # recorded, not raised: one broken trial must not stop the experiment
         res.update(error=repr(e), passed=False)
@@ -575,7 +665,8 @@ def stats(exp):
         s, res = exp.state(t, v, r)
         rows[(t, v, r)] = {"state": s, **({k: res.get(k) for k in (
             "passed", "wall_s", "turns", "tools", "input_tokens", "output_tokens", "files", "add", "dele", "error",
-            "timed_out", "others_mean", "others_max", "check_rc")} if res else {})}
+            "timed_out", "others_mean", "others_max", "check_rc", "passed_initial", "phase2_first", "phase2_final",
+            "rounds")} if res else {})}
     per = {}
     for v in names:
         done = [x for (t, vv, r), x in rows.items() if vv == v and x["state"] == "done"]
@@ -586,7 +677,13 @@ def stats(exp):
                   "inp": median(x.get("input_tokens") for x in done), "turns": median(x.get("turns") for x in done),
                   "lines": median((x.get("add") or 0) + (x.get("dele") or 0) for x in done),
                   "errors": sum(1 for x in done if x.get("error")), "timeouts": sum(1 for x in done if x.get("timed_out")),
-                  "contended": sum(1 for x in done if (x.get("others_max") or 0) > 0)}
+                  "contended": sum(1 for x in done if (x.get("others_max") or 0) > 0),
+                  "initial": sum(1 for x in done if x.get("passed_initial")),
+                  "p2_fail": sum(1 for x in done if x.get("phase2_first") is False),
+                  "rounds": sum(x.get("rounds") or 0 for x in done),
+                  "own_ok_hidden_fail": sum(1 for x in done if x.get("phase2_final") and not x.get("passed")),
+                  "fixed": sum(1 for x in done if x.get("passed") and x.get("passed_initial") is False),
+                  "broke": sum(1 for x in done if not x.get("passed") and x.get("passed_initial"))}
     vd = verdicts(exp)
     pw = []
     for i, a in enumerate(names):
@@ -626,6 +723,7 @@ TRIAL_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta
 <details><summary>prompt the agent got</summary><pre class="mono pre">{prompt}</pre></details>
 <details><summary>variant</summary><pre class="mono pre">{variant}</pre></details>
 <details{chk_open}><summary>acceptance check — {chk}</summary><pre class="mono pre">{check}</pre></details>
+<details><summary>phase 2 (fresh-checkout re-check, every round)</summary><pre class="mono pre">{phase2}</pre></details>
 <details><summary>agent's final message</summary><pre class="mono pre">{final}</pre></details>
 <details><summary>console (last 200 lines)</summary><pre class="mono pre">{console}</pre></details>
 <h2 class="sec">Changes ({nfiles} files, <span class="plus">+{add}</span> <span class="minus">−{dele}</span>)</h2>
@@ -642,6 +740,8 @@ def trial_page(exp, r):
     tile = lambda k, v, cls="": f'<div class="tile"><div class="k">{k}</div><div class="v {cls}">{v}</div></div>'
     ok = r.get("passed")
     tiles = "".join([tile("check", "pass" if ok else "fail", "" if ok else "bad"),
+                     tile("round 0", {True: "pass", False: "fail"}.get(r.get("passed_initial"), "–")),
+                     tile("feedback rounds", r.get("rounds", 0)),
                      tile("wall time", f"{(r.get('wall_s') or 0) / 60:.1f} min"), tile("turns", r.get("turns") or "–"),
                      tile("tool calls", r.get("tools") or 0), tile("tokens out", r.get("output_tokens") or "–"),
                      tile("other agents", f"{r.get('others_max', 0)} max")])
@@ -653,7 +753,7 @@ def trial_page(exp, r):
         tiles=tiles, prompt=html.escape(r.get("prompt", "")),
         variant=html.escape(json.dumps(exp.variants[r["variant"]], indent=1)),
         chk=f"exit {r.get('check_rc')}", chk_open="" if ok else " open", check=read("check.txt", 300),
-        final=html.escape(r.get("final") or "–"), console=read("console.txt", 200),
+        final=html.escape(r.get("final") or "–"), console=read("console.txt", 200), phase2=read("phase2.txt", 300),
         nfiles=len(files), add=sum(f["add"] for f in files), dele=sum(f["del"] for f in files),
         body="\n".join(diffpage.render_file(f, f"f{i}") for i, f in enumerate(files)) or '<div class="note">no changes</div>')
     out = REPORTS / exp.name / f"{r['id']}.html"
@@ -671,6 +771,9 @@ s+=card('Per variant','pass = hidden acceptance check exit 0, with a 95% Wilson 
 s+=card('Head to head','Same task, same repeat. Check: trials where only one side passed decide it (exact McNemar test). Judge: Claude compares the two diffs blind, in both orders; a pair counts as a win only if it wins across both orders, otherwise tie. p < 0.05 ≈ the difference is unlikely to be luck.',
  '<table><tr><th>pair</th><th class="num">paired trials</th><th class="num">only A passes</th><th class="num">only B passes</th><th class="num">check p</th><th class="num">judged</th><th class="num">A wins</th><th class="num">B wins</th><th class="num">ties</th><th class="num">A win rate</th><th class="num">judge p</th><th class="num">median score A / B</th></tr>'+
  D.pairwise.map(w=>`<tr><td>${esc(w.a)} vs ${esc(w.b)}</td><td class="num">${w.pairs}</td><td class="num">${w.only_a}</td><td class="num">${w.only_b}</td><td class="num">${pv(w.mcnemar_p)}</td><td class="num">${w.judged}</td><td class="num">${w.wins_a}</td><td class="num">${w.wins_b}</td><td class="num">${w.ties}</td><td class="num">${w.wins_a+w.wins_b?pct(w.wins_a/(w.wins_a+w.wins_b)):'–'}${ci(w.win_lo,w.win_hi)}</td><td class="num">${pv(w.sign_p)}</td><td class="num">${w.score_a??'–'} / ${w.score_b??'–'}</td></tr>`).join('')+'</table>');
+if(V.some(v=>P[v].p2_fail!=null))s+=card('Verification phase','Every trial: after the agent stops, the task\'s own check runs twice in a fresh checkout of its committed work ("phase 2"). Variants with verify get the failure output back and continue (up to the variant\'s rounds); the others only record it. Hidden pass is graded on pristine tests, before feedback (round 0) and at the end.',
+ '<table><tr><th>variant</th><th class="num">trials</th><th class="num">hidden pass, round 0</th><th class="num">hidden pass, final</th><th class="num">fixed by feedback</th><th class="num">broken by feedback</th><th class="num">"done" but phase 2 failed</th><th class="num">feedback rounds</th><th class="num">own check passes, hidden fails</th></tr>'+
+ V.map((v,i)=>{const p=P[v];return `<tr><td><span class="sw" style="background:${col(i)}"></span>${esc(v)}</td><td class="num">${p.n}</td><td class="num">${p.n?pct(p.initial/p.n):'–'}</td><td class="num">${pct(p.rate)}</td><td class="num">${p.fixed}</td><td class="num">${p.broke}</td><td class="num">${p.p2_fail} (${p.n?pct(p.p2_fail/p.n):'–'})</td><td class="num">${p.rounds}</td><td class="num">${p.own_ok_hidden_fail}</td></tr>`}).join('')+'</table>');
 const cell=c=>{if(c.state!=='done'&&c.state!=='stale')return `<td class="note">${c.state}</td>`;
  const cls=c.passed?'':'bad',t=c.passed?'✔ pass':c.error?'✖ error':c.timed_out?'✖ timeout':'✖ fail';
  return `<td><a class="${cls}" href="${esc(D.name)}/${esc(c.id)}.html">${t}</a>${c.state==='stale'?' <span class="warn">stale</span>':''}<div class="note">${mins((c.wall_s||0)/60)} · ${k(c.output_tokens)} out · ±${k((c.add||0)+(c.dele||0))}${c.others_max?' · shared':''}</div></td>`};
@@ -729,6 +832,9 @@ def main():
     cmd, name, rest = a[0], a[1], a[2:]
     if cmd == "new":
         return cmd_new(name, rest)
+    if cmd == "import":
+        import abbench
+        return abbench.main(a[1:])
     exp = Exp(name)
     {"run": lambda: cmd_run(exp, rest), "status": lambda: cmd_status(exp), "judge": lambda: cmd_judge(exp, rest),
      "report": lambda: (build_report(exp), print(f"reports/ab/{name}.html")), "clean": lambda: cmd_clean(exp)
