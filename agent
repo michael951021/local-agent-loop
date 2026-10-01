@@ -12,6 +12,7 @@
 #   ./agent run   NAME "PROMPT"   one headless run with a custom prompt
 #   ./agent shell NAME            bash inside the sandbox (to poke around)
 #   ./agent list                  list projects
+#   ./agent pool  [N]             keep N agents busy across all projects, newest project first
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -430,7 +431,8 @@ cmd_worker() {
       case $rc in
         0) ;;
         10) echo "✔ all tasks done"; break ;;
-        11) [[ "$waited" == "$job" ]] || echo -e "\033[2m… $wid waiting: $(jq -r '[.claimed[] | "\(.[0]) is on \(.[1][:70])"] | join("; ")' <<<"$job")\033[0m"
+        11) [[ -n "${POOL:-}" ]] && { echo "… nothing to claim — handing the slot back to the pool"; break; }
+            [[ "$waited" == "$job" ]] || echo -e "\033[2m… $wid waiting: $(jq -r '[.claimed[] | "\(.[0]) is on \(.[1][:70])"] | join("; ")' <<<"$job")\033[0m"
             waited="$job"; sleep 30; continue ;;
         12) echo "✖ the remaining tasks depend on tasks that were given up:"; jq -r '.failed[]' <<<"$job"; break ;;
         *) echo "✖ scheduler error ($rc)"; break ;;
@@ -642,5 +644,6 @@ case "$sub" in
   run)   cmd_run "$@" ;;
   shell) cmd_shell "$@" ;;
   list)  cmd_list ;;
-  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  pool)  NUM_PARALLEL="$NUM_PARALLEL" POOL_SKIP="$POOL_SKIP" exec python3 "$ROOT/lib/pool.py" "$@" ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
