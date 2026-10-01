@@ -13,6 +13,7 @@
 #   ./agent shell NAME            bash inside the sandbox (to poke around)
 #   ./agent list                  list projects
 #   ./agent pool  [N]             keep N agents busy across all projects, newest project first
+#   ./agent ab    new|run|status|judge|report|clean EXP   A/B trials of agent variants (lib/ab.py)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -69,7 +70,7 @@ sandbox() {
   local kafile ka_pid ka_port status=0
   kafile="$(mktemp "$RUN/keepalive.XXXXXX")"
   python3 "$ROOT/lib/keepalive.py" 0 "127.0.0.1:$API_PORT" --tag "${SB_TAG:-$(basename "$proj")}" \
-    $([[ "$BACKEND" == llama ]] && echo "--ollama-shim $MODEL") \
+    $([[ "$BACKEND" == llama ]] && echo "--ollama-shim $MODEL") ${SB_KA[@]+"${SB_KA[@]}"} \
     > "$kafile" 2>>"$LOGS/keepalive.log" &
   ka_pid=$!
   for _ in {1..50}; do [[ -s "$kafile" ]] && break; sleep 0.1; done
@@ -631,6 +632,41 @@ cmd_stop() {
 
 cmd_list() { ls -1 "$PROJECTS" 2>/dev/null; }
 
+# ── A/B trials (lib/ab.py drives these; never merged, never touch TODO.md or the loop's worktrees) ──
+# ab_sandbox_setup SPEC: SB_* from a trial spec written by ab.py (binds, tag, sampling override, env overrides).
+ab_sandbox_setup() {
+  local spec="$1" k v a b
+  SB_TAG="$(jq -r .tag "$spec")"; SB_WORKER="$(jq -r .worker "$spec")"
+  while IFS=$'\t' read -r k a b; do SB_BINDS+=("$k" "$a" "$b"); done < <(jq -r '.binds[]? | @tsv' "$spec")
+  local ov; ov="$(jq -c '.sampling // {}' "$spec")"; [[ "$ov" == "{}" ]] || SB_KA=(--override "$ov")
+  while IFS=$'\t' read -r k v; do
+    case "$k" in
+      NUM_CTX|CTX_MARGIN|MAX_TURNS|ITER_TIMEOUT|AGENT_READ_MAX_LINES|AGENT_READ_MAX_CHARS) printf -v "$k" '%s' "$v"; export "$k" ;;
+      *) die "trial env $k is not one of the A/B knobs" ;;
+    esac
+  done < <(jq -r '.env // {} | to_entries[] | "\(.key)\t\(.value)"' "$spec")
+}
+
+cmd_abrun() {   # _abrun SPEC — one trial: claude -p in the trial's worktree, stream-json to SPEC.log
+  local spec="$1"; check_ollama
+  local SB_BINDS=() SB_ENV=() SB_KA=() SB_TAG SB_WORKER
+  ab_sandbox_setup "$spec"
+  local wt log rid sysf args=(--append-system-prompt-file /opt/agent/prompts/system.md)
+  wt="$(jq -r .workdir "$spec")"; log="$(jq -r .log "$spec")"; rid="$(jq -r .run "$spec")"
+  sysf="$(jq -r '.system // empty' "$spec")"
+  if [[ -n "$sysf" ]]; then SB_BINDS+=(--ro-bind "$sysf" /opt/agent/ab-system.md); args=(--append-system-prompt-file /opt/agent/ab-system.md); fi
+  sandbox "$wt" -- timeout --kill-after=60 "$ITER_TIMEOUT" claude -p "$(jq -r .prompt "$spec")" "${args[@]}" \
+    --dangerously-skip-permissions --max-turns "$MAX_TURNS" --output-format stream-json --verbose \
+    < /dev/null | tee -a "$log" | AGENT_RUN="$rid" python3 "$ROOT/lib/pretty.py"
+}
+
+cmd_abcheck() {   # _abcheck SPEC — the trial's acceptance check, sandboxed, no model access needed
+  local spec="$1"
+  local SB_BINDS=() SB_ENV=() SB_KA=() SB_TAG SB_WORKER
+  ab_sandbox_setup "$spec"
+  sandbox "$(jq -r .workdir "$spec")" -- timeout --kill-after=30 "$(jq -r '.check_timeout // 900' "$spec")" bash -c "$(jq -r .check "$spec")"
+}
+
 mkdir -p "$SANDBOX_HOME" "$PROJECTS" "$LOGS" "$RUN"
 sub="${1:-}"; shift || true
 case "$sub" in
@@ -644,6 +680,9 @@ case "$sub" in
   run)   cmd_run "$@" ;;
   shell) cmd_shell "$@" ;;
   list)  cmd_list ;;
+  ab)    NUM_PARALLEL="$NUM_PARALLEL" exec python3 "$ROOT/lib/ab.py" "$@" ;;
+  _abrun) cmd_abrun "$@" ;;
+  _abcheck) cmd_abcheck "$@" ;;
   pool)  NUM_PARALLEL="$NUM_PARALLEL" POOL_SKIP="$POOL_SKIP" exec python3 "$ROOT/lib/pool.py" "$@" ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

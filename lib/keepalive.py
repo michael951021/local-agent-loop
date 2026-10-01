@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """HTTP proxy to Ollama that keeps slow SSE streams alive.
 
-  keepalive.py PORT HOST:PORT [--tag TAG] [--ollama-shim MODEL]
+  keepalive.py PORT HOST:PORT [--tag TAG] [--ollama-shim MODEL] [--override JSON]
                                            listen on 127.0.0.1:PORT (0 = pick one; printed first)
+
+--override JSON merges fields into every model request body (A/B trials vary sampling this way, e.g.
+{"temperature": 0.6, "top_p": 0.95}); the ledger records the override with each request.
 
 Ollama sends a tool_use block only once the whole call is generated, so a long Write can leave the
 stream silent for minutes and trip Claude Code's 300 s idle watchdog. While the upstream request is
@@ -144,7 +147,7 @@ def shim(path, model):
             "/api/version": {"version": "llama-server"}}.get(path)
 
 
-async def handle(client_r, client_w, upstream, tag, model=None):
+async def handle(client_r, client_w, upstream, tag, model=None, override=None):
     up_w, entry = None, None
     try:
         first, lines, headers = await read_head(client_r)
@@ -158,8 +161,13 @@ async def handle(client_r, client_w, upstream, tag, model=None):
             return
         start = time.monotonic()
         path = first.split(" ")[1].split("?")[0]
+        drop_up = {"connection", "keep-alive"}
         if ("/v1/messages" in path and "count_tokens" not in path) or path.endswith("/chat/completions"):
             entry = {"tag": tag, "t0": round(time.time(), 3), "path": path}
+            if override:
+                body = json.dumps({**json.loads(body), **override}).encode()
+                drop_up.add("content-length")
+                entry["override"] = override
             try:
                 entry["phase"], entry["req"] = phases.classify(path, body)
             except Exception as e:   # never cost us the request
@@ -167,7 +175,10 @@ async def handle(client_r, client_w, upstream, tag, model=None):
             if entry["phase"] in SAMPLED:
                 save_sample(body, entry)
         up_r, up_w = await asyncio.open_connection(*upstream)
-        up_w.write(rewrite(first, lines, {"connection", "keep-alive"}) + body)
+        head = rewrite(first, lines, drop_up)
+        if "content-length" in drop_up:
+            head = head[:-2] + b"Content-Length: %d\r\n\r\n" % len(body)
+        up_w.write(head + body)
         await up_w.drain()
 
         status, lines, headers = await read_head(up_r)
@@ -211,9 +222,10 @@ async def main():
     port, target = int(sys.argv[1]), sys.argv[2]
     tag = sys.argv[sys.argv.index("--tag") + 1] if "--tag" in sys.argv else "untagged"
     model = sys.argv[sys.argv.index("--ollama-shim") + 1] if "--ollama-shim" in sys.argv else None
+    override = json.loads(sys.argv[sys.argv.index("--override") + 1]) if "--override" in sys.argv else None
     host, tport = target.rsplit(":", 1)
     server = await asyncio.start_server(
-        lambda r, w: handle(r, w, (host, int(tport)), tag, model), "127.0.0.1", port, limit=1 << 20)
+        lambda r, w: handle(r, w, (host, int(tport)), tag, model, override), "127.0.0.1", port, limit=1 << 20)
     print(server.sockets[0].getsockname()[1], flush=True)
     parent = os.getppid()
     async with server:

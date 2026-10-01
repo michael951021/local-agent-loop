@@ -4,7 +4,7 @@
   pool.py [SLOTS]      (./agent pool [N]; default NUM_PARALLEL)
 
 Every POLL seconds: busy = live workers holding a claim (run/*/workers/wK.json or main.json, any project, pool
-or not). When busy < SLOTS on two polls in a row (a worker between tasks drops its claim for a moment), the
+or not) plus running A/B trials (run/ab/EXP/*.pid; lib/ab.py only starts those in slots the loop leaves free). When busy < SLOTS on two polls in a row (a worker between tasks drops its claim for a moment), the
 newest project (first commit) with a ready TODO task and no idle worker of its own gets `./agent worker NAME`
 in a new window of tmux session `pool`, with POOL=1: that worker exits as soon as it has nothing to claim, so
 the slot comes back here instead of sleeping on a dependency chain.
@@ -74,10 +74,12 @@ def main():
     while True:
         names = projects()
         live = {n: workers(n) for n in names}
-        busy = sum(c for w in live.values() for c in w.values())
+        trials = sum(1 for p in (RUN / "ab").glob("*/*.pid") if sched.alive(p.read_text().strip() or 0))
+        busy = sum(c for w in live.values() for c in w.values()) + trials
         pending = sum(1 for n, t in recent.items() if time.time() - t < SPAWN_GRACE and not any(live.get(n, {}).values()))
         short = short + 1 if busy + pending < slots else 0
-        line = f"busy {busy}/{slots} · " + ", ".join(f"{n}:{sum(w.values())}" for n, w in live.items() if w)
+        line = f"busy {busy}/{slots} · " + ", ".join(f"{n}:{sum(w.values())}" for n, w in live.items() if w) \
+            + (f", A/B trials:{trials}" if trials else "")
         if line != last:
             print(time.strftime("%H:%M:%S"), line, flush=True)
             last = line

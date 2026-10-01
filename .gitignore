@@ -15,3 +15,5 @@ work/
 ffprof/
 shot.png
 .venv/
+# A/B trial output (diffs stay on the project branches ab/EXP/*)
+ab/*/trials/
